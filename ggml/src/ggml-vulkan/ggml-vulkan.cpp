@@ -7860,10 +7860,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                                   y_decode_vector_staging || y_needs_k_padding);
     const bool qy_needs_dequant = y_needs_reformat;
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, nei1, true));
+    // EXPERIMENT (GGML_VK_MMID_SMALLN=1): select the matmul tile by the EXPECTED PER-EXPERT
+    // token count rather than the whole batch. With E experts and nei0 active per token, each
+    // expert sees ~nei1*nei0/E rows; selecting by aggregate nei1 always picks the widest tile
+    // and leaves most N-lanes empty at MoE prefill (measured: MUL_MAT_ID at ~20% of dense
+    // matmul efficiency, ~78% of MoE prefill time on Qwen3.6-35B-A3B).
+    uint32_t n_for_tile = (uint32_t)nei1;
+    static const char * mmid_smalln_env = getenv("GGML_VK_MMID_SMALLN");
+    if (mmid_smalln_env && atoi(mmid_smalln_env) != 0 && ne02 > 1) {
+        n_for_tile = std::max<uint32_t>(1u, (uint32_t)((nei1 * nei0 + ne02 - 1) / ne02));
+    }
+
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, n_for_tile, true));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, nei1, aligned, true);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, n_for_tile, aligned, true);
 
     const uint32_t bn = pipeline->wg_denoms[1];
     const uint64_t max_tiles = ggml_vk_mul_mat_id_max_tiles(n_as, nei0 * nei1, bn);

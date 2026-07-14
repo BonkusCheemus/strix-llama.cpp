@@ -2542,6 +2542,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 s_tile.warptile[1] = 64;  // BM
                 s_tile.wg_denoms[0] = 64;
             }
+            // GGML_VK_MMID_M128=1: same idea for the medium tile (BM 64->128, four
+            // warps) - the tile the per-expert-n heuristic picks at n~64 (e.g. ub2048).
+            auto & m_tile = tc_mmq_id[1];
+            const char * m128_env = getenv("GGML_VK_MMID_M128");
+            if (m128_env && atoi(m128_env) != 0) {
+                m_tile.warptile[0] = 4 * mul_mat_subgroup_size;  // BLOCK_SIZE
+                m_tile.warptile[1] = 128;  // BM
+                m_tile.wg_denoms[0] = 128;
+            }
         }
 
         auto cm1_create = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,

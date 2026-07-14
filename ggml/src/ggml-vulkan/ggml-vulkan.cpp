@@ -2520,6 +2520,30 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             tc_mmq_id[2] = { { 512, 128, 128, 32, 32, 32, 2, device->coopmat_m, device->coopmat_n, device->coopmat_k, 32 }, { 128, 128, 1 }, 32 };
         }
 
+        // EXPERIMENT (GGML_VK_MMID_TILE16=1): narrow the matmul_id small tile to BN=16.
+        // MoE prefill leaves ~nei1*nei0/n_expert rows per expert (~16 at ub512/256E/8a),
+        // so even the 32-wide small tile runs half empty. Only meaningful stacked on
+        // GGML_VK_MMID_SMALLN=1 (routes mmid to the small tile) + the row-list prepass.
+        // Shadows the s-tile config for the mmid quant pipelines only; dense unaffected.
+        {
+            auto & s_tile = tc_mmq_id[0];
+            const char * tile16_env = getenv("GGML_VK_MMID_TILE16");
+            if (tile16_env && atoi(tile16_env) != 0) {
+                s_tile.warptile[2] = 16;  // BN
+                s_tile.warptile[5] = 16;  // WN
+                s_tile.wg_denoms[1] = 16;
+            }
+            // GGML_VK_MMID_BM64=1: taller small tile (BM 32->64, two warps). Same
+            // A-traffic (ic-tile count unchanged), halves per-expert B re-reads
+            // (ir-tile count), larger WGs to hide latency.
+            const char * bm64_env = getenv("GGML_VK_MMID_BM64");
+            if (bm64_env && atoi(bm64_env) != 0) {
+                s_tile.warptile[0] = 2 * mul_mat_subgroup_size;  // BLOCK_SIZE
+                s_tile.warptile[1] = 64;  // BM
+                s_tile.wg_denoms[0] = 64;
+            }
+        }
+
         auto cm1_create = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                               const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc) {
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);

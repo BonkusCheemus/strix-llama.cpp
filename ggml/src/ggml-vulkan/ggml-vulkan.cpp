@@ -7819,6 +7819,18 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     }
 }
 
+// EXPERIMENT (GGML_VK_MMID_F16B=1): convert the contiguous f32 activations (B) of
+// quantized MUL_MAT_ID to f16 and run the f16-B matmul_id kernels instead of the
+// f32-B ones. Halves B bytes and buf_b shared memory (better occupancy) at the
+// f32->f16 rounding cost upstream already accepts on the coopmat2 path.
+static bool ggml_vk_mmid_f16b_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_VK_MMID_F16B");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -7897,8 +7909,22 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                               ctx->device->vendor_id == VK_VENDOR_ID_INTEL &&
                               ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
+    // EXPERIMENT (GGML_VK_MMID_F16B=1): route quantized MUL_MAT_ID through the f16-B kernels
+    // on KHR_coopmat devices too. Halves B bytes and buf_b shared memory at the f32->f16
+    // rounding cost the coopmat2 path already accepts.
+    const bool mmid_f16b = ggml_vk_mmid_f16b_enabled() &&
+                           ctx->device->coopmat_support && !ctx->device->coopmat2 &&
+                           ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
+    if (mmid_f16b) {
+        static bool mmid_f16b_logged = false;
+        if (!mmid_f16b_logged) {
+            mmid_f16b_logged = true;
+            fprintf(stderr, "ggml_vulkan: MUL_MAT_ID f16-B path engaged (GGML_VK_MMID_F16B)\n");
+        }
+    }
+
     const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
-                                        (ggml_prec)dst->op_params[0], true, can_quantize_y, prefer_f16_b);
+                                        (ggml_prec)dst->op_params[0], true, can_quantize_y, prefer_f16_b || mmid_f16b);
 
     const bool quantize_y   = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel = y_kernel_type == GGML_TYPE_F32;

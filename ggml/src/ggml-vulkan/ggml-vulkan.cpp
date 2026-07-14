@@ -2520,6 +2520,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             tc_mmq_id[2] = { { 512, 128, 128, 32, 32, 32, 2, device->coopmat_m, device->coopmat_n, device->coopmat_k, 32 }, { 128, 128, 1 }, 32 };
         }
 
+        bool mmid_wave32 = false;
+
         // EXPERIMENT (GGML_VK_MMID_TILE16=1): narrow the matmul_id small tile to BN=16.
         // MoE prefill leaves ~nei1*nei0/n_expert rows per expert (~16 at ub512/256E/8a),
         // so even the 32-wide small tile runs half empty. Only meaningful stacked on
@@ -2551,18 +2553,46 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 m_tile.warptile[1] = 128;  // BM
                 m_tile.wg_denoms[0] = 128;
             }
+            // GGML_VK_MMID_WAVE32=1: force required subgroup size 32 on the mmid
+            // quant coopmat pipelines (RDNA3.x WMMA is wave32-native; probe whether
+            // RADV lowers KHR_coopmat better at wave32). The cm1 path derives its
+            // warp grid from the real subgroup and sizes shared arrays with
+            // NUM_WARPS = BLOCK_SIZE / WARP, so the WARP spec constant must equal the
+            // forced size, and the coverage invariant NUM_WARPS == (BM/WM)*(BN/WN) must
+            // be restored: BLOCK_SIZE is kept, WM (or WN) is halved until the warp grid
+            // tiles BM x BN again. Runs after the BM64/M128 gates so it composes with
+            // them. Applies only when the driver honors a required size of 32.
+            const char * wave32_env = getenv("GGML_VK_MMID_WAVE32");
+            if (wave32_env && atoi(wave32_env) != 0 && device->subgroup_size_control &&
+                device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size) {
+                mmid_wave32 = true;
+                for (auto & tc : tc_mmq_id) {
+                    auto & w = tc.warptile;
+                    // {BLOCK_SIZE, BM, BN, BK, WM, WN, WMITER, TM, TN, TK, WARP}
+                    w[10] = 32;  // WARP: must match the forced subgroup size
+                    for (int guard = 0; guard < 4 && w[0] / w[10] != (w[1] / w[4]) * (w[2] / w[5]); ++guard) {
+                        if (w[4] >= w[5] && w[4] > w[7]) {
+                            w[4] /= 2;  // halve WM, keeping WM >= TM
+                        } else {
+                            w[5] /= 2;  // halve WN
+                        }
+                    }
+                    GGML_ASSERT(w[0] / w[10] == (w[1] / w[4]) * (w[2] / w[5]));  // NUM_WARPS == (BM/WM)*(BN/WN)
+                    GGML_ASSERT(w[4] >= w[7] && w[5] >= w[8]);                   // WM >= TM, WN >= TN
+                }
+            }
         }
 
         auto cm1_create = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                               const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc) {
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
-            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, cm1_spec, false, true, 0, true, cm1_pin);
+            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, cm1_spec, false, true, 0, true, cm1_pin || (mmid_wave32 && &tc_base == &tc_mmq_id));
         };
         auto cm1_create_quant = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                                     const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc) {
             spec_fn_t qs = [&, type_a=key.type_a](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec_quant(wt, a, (uint32_t)type_a); };
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
-            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, qs, false, true, 0, true, cm1_pin);
+            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, qs, false, true, 0, true, cm1_pin || (mmid_wave32 && &tc_base == &tc_mmq_id));
         };
         // int8 MMQ helper: per-type cm1 shader, warptile passed as-is (carries DEVICE_ARCH in
         // spec constant WARP_SIZE_IDX+1), subgroup size pinned to the warptile WARP element, no aligned variant.

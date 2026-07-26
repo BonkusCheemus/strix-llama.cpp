@@ -7914,7 +7914,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // rounding cost the coopmat2 path already accepts.
     const bool mmid_f16b = ggml_vk_mmid_f16b_enabled() &&
                            ctx->device->coopmat_support && !ctx->device->coopmat2 &&
-                           ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
+                           ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
+                           // only take the f16-B path if a pipeline exists for this src0 type
+                           // (e.g. Q2_0 has none); otherwise fall through to the normal f32-B path.
+                           ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_F16, (ggml_prec)dst->op_params[0], true) != nullptr;
     if (mmid_f16b) {
         static bool mmid_f16b_logged = false;
         if (!mmid_f16b_logged) {

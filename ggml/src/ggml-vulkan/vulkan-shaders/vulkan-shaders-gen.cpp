@@ -872,7 +872,14 @@ void process_shaders() {
     string_to_spv("flash_attn_gather_f16", "flash_attn_gather.comp", {});
     string_to_spv("flash_attn_union_f16", "flash_attn_union.comp", {});
     string_to_spv("flash_attn_gather_union_f16", "flash_attn_gather_union.comp", {});
-    string_to_spv("flash_attn_gather_union_dq_q8_0", "flash_attn_gather_union_dq.comp", {});
+    // one decoder per quantised K type flash-attention supports natively; f16/bf16/f32 need no
+    // decode and take the verbatim gather
+    // q8_0 and q4_0 only: each needs its true element mapping written out (see the shader), and
+    // these are the two types actually used as a KV cache. The rest take the verbatim gather.
+    for (const auto& tname : {"q4_0", "q8_0"}) {
+        string_to_spv("flash_attn_gather_union_dq_" + std::string(tname), "flash_attn_gather_union_dq.comp",
+                      {{"DATA_A_" + to_uppercase(tname), "1"}});
+    }
 
     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
     string_to_spv("mul_mat_vec_p021_f16_f32",              "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});

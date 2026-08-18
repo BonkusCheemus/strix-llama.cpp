@@ -2520,6 +2520,70 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             tc_mmq_id[2] = { { 512, 128, 128, 32, 32, 32, 2, device->coopmat_m, device->coopmat_n, device->coopmat_k, 32 }, { 128, 128, 1 }, 32 };
         }
 
+        // Deterministic subgroup sizing for the dense coopmat pipelines. Two parts:
+        //
+        // (1) The required subgroup size is the tile's own WARP, not the driver's choice. The cm1
+        //     shaders derive their warp grid from the real subgroup (warp_i = gl_SubgroupID) and
+        //     size shared arrays with NUM_WARPS = BLOCK_SIZE / WARP, so WARP and the actual
+        //     subgroup must agree - leaving that to the driver makes the agreement incidental.
+        //
+        // (2) The QUANTISED dense tiles run at wave32. RDNA3.x WMMA is wave32-native, so a wave64
+        //     subgroup issues each coopmat op as two halves. BLOCK_SIZE is kept, so the subgroup
+        //     count doubles and WM (or WN) halves until the warp grid tiles BM x BN again:
+        //     NUM_WARPS == (BM/WM)*(BN/WN). A tile that cannot be retiled is left at wave64.
+        //
+        // The FLOAT tiles are deliberately excluded. Measured on gfx1151 with a standalone
+        // MUL_MAT microbench at both dense FFN shapes (m=25600 k=5120, m=5120 k=25600):
+        // q6_K +5.2..+10.8%, q8_0 +5.4..+8.4%, q4_K +0.7..+9.1%, q4_0 -1.5..+1.8%, but
+        // f16 -6.7..+6.4% and bf16 ~0. The win tracks inline dequant instruction count
+        // (q6_K 3907 -> 3433 instructions at wave32, identical 192 VGPRs and 8 subgroups/SIMD),
+        // so it lands on the issue-bound quantised kernels and not on the float ones, which are
+        // bandwidth-bound on the weight stream.
+        //
+        // Scoped to AMD coopmat1 on a wave64 default; other vendors keep the driver default,
+        // since none of the above is validated there.
+        // GGML_VK_DENSE_WAVE32=0 disables, =2 additionally retiles the float tiles (probe).
+        const bool dense_sgs_scope =
+            device->vendor_id == VK_VENDOR_ID_AMD &&
+            device->driver_id != vk::DriverId::eAmdProprietary &&
+            device->subgroup_size_control;
+        const bool dense_wave32_possible =
+            dense_sgs_scope &&
+            device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size &&
+            device->subgroup_size > 32;
+        const char * dense_wave32_env = getenv("GGML_VK_DENSE_WAVE32");
+        const int    dense_wave32     = dense_wave32_env ? atoi(dense_wave32_env) : 1;
+
+        if (dense_wave32_possible && dense_wave32 != 0) {
+            auto wave32_tile = [](std::vector<uint32_t> & w) -> bool {
+                // {BLOCK_SIZE, BM, BN, BK, WM, WN, WMITER, TM, TN, TK, WARP}
+                std::vector<uint32_t> t = w;
+                t[10] = 32;
+                for (int guard = 0; guard < 4 && t[0] / t[10] != (t[1] / t[4]) * (t[2] / t[5]); ++guard) {
+                    if (t[4] >= t[5] && t[4] > t[7]) {
+                        t[4] /= 2;  // halve WM, keeping WM >= TM
+                    } else {
+                        t[5] /= 2;  // halve WN
+                    }
+                }
+                if (t[0] / t[10] != (t[1] / t[4]) * (t[2] / t[5]) || t[4] < t[7] || t[5] < t[8]) {
+                    return false;
+                }
+                w = t;
+                return true;
+            };
+            for (auto & tc : tc_mmq) {
+                wave32_tile(tc.warptile);
+            }
+            if (dense_wave32 >= 2) {
+                for (auto & tc : tc_mm) {
+                    wave32_tile(tc.warptile);
+                }
+            }
+        }
+        // WARP -> required subgroup size for every cm1 pipeline in scope (pin_subgroup_to_warp)
+        const bool dense_pin = dense_sgs_scope;
+
         bool mmid_wave32 = false;
 
         // EXPERIMENT (GGML_VK_MMID_TILE16=1): narrow the matmul_id small tile to BN=16.
@@ -2586,13 +2650,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         auto cm1_create = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                               const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc) {
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
-            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, cm1_spec, false, true, 0, true, cm1_pin || (mmid_wave32 && &tc_base == &tc_mmq_id));
+            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, cm1_spec, false, true, 0, true, cm1_pin || dense_pin || (mmid_wave32 && &tc_base == &tc_mmq_id));
         };
         auto cm1_create_quant = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                                     const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc) {
             spec_fn_t qs = [&, type_a=key.type_a](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec_quant(wt, a, (uint32_t)type_a); };
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
-            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, qs, false, true, 0, true, cm1_pin || (mmid_wave32 && &tc_base == &tc_mmq_id));
+            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, qs, false, true, 0, true, cm1_pin || dense_pin || (mmid_wave32 && &tc_base == &tc_mmq_id));
         };
         // int8 MMQ helper: per-type cm1 shader, warptile passed as-is (carries DEVICE_ARCH in
         // spec constant WARP_SIZE_IDX+1), subgroup size pinned to the warptile WARP element, no aligned variant.

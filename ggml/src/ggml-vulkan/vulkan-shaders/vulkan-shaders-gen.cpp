@@ -879,6 +879,8 @@ void process_shaders() {
     for (const auto& tname : {"q4_0", "q8_0"}) {
         string_to_spv("flash_attn_gather_union_dq_" + std::string(tname), "flash_attn_gather_union_dq.comp",
                       {{"DATA_A_" + to_uppercase(tname), "1"}});
+        string_to_spv("flash_attn_gather_dq_" + std::string(tname), "flash_attn_gather_dq.comp",
+                      {{"DATA_A_" + to_uppercase(tname), "1"}});
     }
 
     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});

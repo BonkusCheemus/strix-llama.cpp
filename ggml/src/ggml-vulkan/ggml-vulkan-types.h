@@ -657,6 +657,22 @@ static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
 
 class vk_memory_logger;
 
+// Indexer head counts we build kernels for: 4 = Qwen4-exp (qwen4_exp), 64 = DeepSeek-V4 and
+// GLM-DSA, 32 kept because test-backend-ops exercises it. N_HEAD is a specialization constant,
+// so each entry is a separately compiled kernel with the head loop fully unrolled - as a push
+// constant the loop cannot unroll and decode costs ~55% more (measured, gfx1151, kv=131584).
+static constexpr uint32_t LI_NH_VALUES[] = { 4, 32, 64 };
+#define LI_NH_COUNT (sizeof(LI_NH_VALUES) / sizeof(LI_NH_VALUES[0]))
+
+static inline int ggml_vk_li_nh_index(int64_t nh) {
+    for (size_t i = 0; i < LI_NH_COUNT; ++i) {
+        if ((int64_t) LI_NH_VALUES[i] == nh) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
@@ -966,10 +982,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
-    vk_pipeline pipeline_lightning_indexer_f16;
-    vk_pipeline pipeline_lightning_indexer_cm_f16;
-    vk_pipeline pipeline_lightning_indexer_cm_small_f16;
-    vk_pipeline pipeline_lightning_indexer_decode_cm_f16;
+    // One pipeline per supported indexer head count; see LI_NH_VALUES.
+    vk_pipeline pipeline_lightning_indexer_f16[LI_NH_COUNT];
+    vk_pipeline pipeline_lightning_indexer_cm_f16[LI_NH_COUNT];
+    vk_pipeline pipeline_lightning_indexer_cm_small_f16[LI_NH_COUNT];
+    vk_pipeline pipeline_lightning_indexer_decode_cm_f16[LI_NH_COUNT];
     vk_pipeline pipeline_flash_attn_top_k_f16;
     vk_pipeline pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;

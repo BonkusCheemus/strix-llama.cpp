@@ -1222,8 +1222,19 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        const int64_t n = rows ? rows->ne[0] : embd->ne[1];
-        return n == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+
+        const int64_t n_want = (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+
+        // exactly one of the two is built: `rows` when the table is a tensor and the
+        // graph does the get_rows, `embd` when --ngram-on-disk gathered it in set_input.
+        // Dereferencing `rows` unconditionally segfaults on every on-disk decode.
+        if (rows) {
+            return rows->ne[0] == n_want;      // I32 [n_heads*n_tokens]
+        }
+        if (embd) {
+            return embd->ne[1] == n_want;      // F32 [ple_head_dim, n_heads*n_tokens]
+        }
+        return false;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
@@ -1303,7 +1314,11 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
 
     const auto & qmodel = static_cast<const llama_model_qwen4exp &>(model);
     if (qmodel.ple_disk) {
-        // idx already holds one global row per (token, head), token-major: the layout get_rows would produce
+        // idx is already exactly what the reader wants: one global row per (token, head),
+        // token-major, with ple_head_offsets folded in by the loop above. The previous
+        // version read it head-major and added the offset a second time, which is only
+        // correct for a table split per head -- on a joined per_layer_token_embd it walks
+        // past the end (rows beyond ple_rows) and gather() aborts.
         GGML_ASSERT(embd != nullptr && rows == nullptr);
         embd_buf.resize(idx.size() * (size_t) hparams.ple_head_dim);
         qmodel.ple_disk->gather(idx.data(), idx.size(), embd_buf.data());

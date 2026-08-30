@@ -2539,7 +2539,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // A-traffic (ic-tile count unchanged), halves per-expert B re-reads
             // (ir-tile count), larger WGs to hide latency.
             const char * bm64_env = getenv("GGML_VK_MMID_BM64");
-            if (bm64_env && atoi(bm64_env) != 0) {
+            if (!bm64_env || atoi(bm64_env) != 0) {   // on by default; =0 disables
                 s_tile.warptile[0] = 2 * mul_mat_subgroup_size;  // BLOCK_SIZE
                 s_tile.warptile[1] = 64;  // BM
                 s_tile.wg_denoms[0] = 64;
@@ -2548,7 +2548,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // warps) - the tile the per-expert-n heuristic picks at n~64 (e.g. ub2048).
             auto & m_tile = tc_mmq_id[1];
             const char * m128_env = getenv("GGML_VK_MMID_M128");
-            if (m128_env && atoi(m128_env) != 0) {
+            if (!m128_env || atoi(m128_env) != 0) {   // on by default; =0 disables
                 m_tile.warptile[0] = 4 * mul_mat_subgroup_size;  // BLOCK_SIZE
                 m_tile.warptile[1] = 128;  // BM
                 m_tile.wg_denoms[0] = 128;
@@ -2563,7 +2563,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // tiles BM x BN again. Runs after the BM64/M128 gates so it composes with
             // them. Applies only when the driver honors a required size of 32.
             const char * wave32_env = getenv("GGML_VK_MMID_WAVE32");
-            if (wave32_env && atoi(wave32_env) != 0 && device->subgroup_size_control &&
+            if ((!wave32_env || atoi(wave32_env) != 0) && device->subgroup_size_control &&   // on by default; =0 disables
                 device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size) {
                 mmid_wave32 = true;
                 for (auto & tc : tc_mmq_id) {
@@ -7826,7 +7826,7 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
 static bool ggml_vk_mmid_f16b_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_VK_MMID_F16B");
-        return env != nullptr && atoi(env) != 0;
+        return env == nullptr || atoi(env) != 0;   // on by default; =0 disables
     }();
     return enabled;
 }
@@ -7959,7 +7959,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // matmul efficiency, ~78% of MoE prefill time on Qwen3.6-35B-A3B).
     uint32_t n_for_tile = (uint32_t)nei1;
     static const char * mmid_smalln_env = getenv("GGML_VK_MMID_SMALLN");
-    if (mmid_smalln_env && atoi(mmid_smalln_env) != 0 && ne02 > 1) {
+    if (!(mmid_smalln_env && atoi(mmid_smalln_env) == 0) && ne02 > 1) {   // on by default; =0 disables
         n_for_tile = std::max<uint32_t>(1u, (uint32_t)((nei1 * nei0 + ne02 - 1) / ne02));
     }
 

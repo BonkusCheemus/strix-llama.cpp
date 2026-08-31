@@ -285,6 +285,11 @@ public:
 
     // part of the reuse key: a seq_cp between two ubatches can change it
     bool s_copy_main_identity = false;
+
+    // DRC phase 2: pending-replay length baked into this graph's topology (an extra
+    // ggml_gated_delta_net(K=1) reconstruction per replay step) -- must match for valid reuse,
+    // same as head/rs_z above.
+    uint32_t replay_len = 0;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

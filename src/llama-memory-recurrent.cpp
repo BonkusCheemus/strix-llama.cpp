@@ -35,6 +35,16 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
 
+    // DRC phase 2: opt-in via LLAMA_GDN_REPLAY (mirrors the LLAMA_SPEC_CHAIN env-gate pattern in
+    // common/speculative.cpp), off by default. Only meaningful when n_rs_seq > 0 and the arch
+    // exposes a nonzero n_embd_s_ingredient() (GDN/KDA layers).
+    {
+        const char * env = getenv("LLAMA_GDN_REPLAY");
+        this->gdn_replay = n_rs_seq > 0 && hparams.n_embd_s_ingredient() > 0 &&
+            env != nullptr && strcmp(env, "0") != 0;
+    }
+    replay_len.assign(n_seq_max, 0);
+
     cells.clear();
     cells.resize(mem_size);
 
@@ -50,9 +60,13 @@ llama_memory_recurrent::llama_memory_recurrent(
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
+            // r_l + s_l per layer always; gdn_replay additionally allocates ingr_l + s_ckpt_l.
+            const uint32_t tensors_per_layer = gdn_replay ? 4u : 2u;
             ggml_init_params params = {
-                // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                // r and s per layer, the separate PLE conv row where the model has one, plus
+                // ingr_l + s_ckpt_l under gdn_replay. Take the widest of the two counts: the
+                // replay path and the PLE path are independent, so max(), not either-or.
+                /*.mem_size   =*/ size_t(std::max(tensors_per_layer, hparams.ple_conv_state() > 0 ? 3u : 2u))*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -73,6 +87,10 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     p_l.resize(n_layer);
+    if (gdn_replay) {
+        ingr_l.resize(n_layer);
+        s_ckpt_l.resize(n_layer);
+    }
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -98,9 +116,14 @@ llama_memory_recurrent::llama_memory_recurrent(
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
-        const uint32_t n_rows = mem_size * (1 + n_rs_seq);
-        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        // r (conv state) keeps its existing (1 + n_rs_seq)-wide layout regardless of gdn_replay --
+        // phase 2 only replaces the GDN delta-net state (s) snapshot storage.
+        const uint32_t n_rows_r = mem_size * (1 + n_rs_seq);
+        // s: with gdn_replay, only the authoritative state is kept here (no widening); the
+        // (1 + n_rs_seq)-wide K-snapshot storage this replaces moves to ingr_l below.
+        const uint32_t n_rows_s = gdn_replay ? mem_size : mem_size * (1 + n_rs_seq);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows_r);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows_s);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
@@ -108,9 +131,25 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
         if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
-            ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), n_rows);
+            // n_rows_r, not the old n_rows: upstream split the single row count into n_rows_r
+            // (conv, stays (1 + n_rs_seq)-wide) and n_rows_s (state, unwidens under gdn_replay).
+            // PLE is a conv-style row, so it follows r. Using the old n_rows here would not
+            // compile; using n_rows_s would silently shrink it under gdn_replay.
+            ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), n_rows_r);
             ggml_format_name(p, "cache_ple_r_l%d", i);
             p_l[i] = p;
+        }
+
+        if (gdn_replay) {
+            const uint32_t n_rows_ingr = mem_size * n_rs_seq;
+            ggml_tensor * ingr = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s_ingredient(), n_rows_ingr);
+            ggml_format_name(ingr, "cache_ingr_l%d", i);
+            ingr_l[i] = ingr;
+
+            // oldest-edge-of-window checkpoint to replay from -- see the field comment in the header.
+            ggml_tensor * ckpt = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), mem_size);
+            ggml_format_name(ckpt, "cache_s_ckpt_l%d", i);
+            s_ckpt_l[i] = ckpt;
         }
     }
 
@@ -156,6 +195,7 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(replay_len.begin(), replay_len.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -176,7 +216,17 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
-        set_rs_idx(seq_id, 0);
+        if (seq_id >= 0) {
+            set_rs_idx(seq_id, 0);
+            if (gdn_replay && (size_t) seq_id < replay_len.size()) {
+                // a released/fully-cleared slot must not carry a pending replay into whatever
+                // (possibly unrelated) sequence reuses it next.
+                replay_len[seq_id] = 0;
+            }
+        } else {
+            std::fill(rs_idx.begin(), rs_idx.end(), 0);
+            std::fill(replay_len.begin(), replay_len.end(), 0);
+        }
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -190,13 +240,21 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
 
-            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            // partial rollback via per-token snapshot index (bounded by n_rs_seq), or (gdn_replay)
+            // via a pending replay of the last `rollback` ingredient-ring steps.
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
-                // pending rollback is single-use
+                // Upstream drops the single-use guard here. KEPT for the snapshot path on
+                // purpose: under gdn_replay rs_idx is never raised, so `pending` is vacuous
+                // there, while removing it would weaken the path we already ship. The replay
+                // branch is guarded by rs_idx == 0 in get_rs_idx() instead.
                 const bool pending = rs_idx[seq_id] != 0;
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
-                    set_rs_idx(seq_id, (uint32_t) rollback);
+                    if (gdn_replay) {
+                        replay_len[seq_id] = (uint32_t) rollback;
+                    } else {
+                        set_rs_idx(seq_id, (uint32_t) rollback);
+                    }
                     cell.pos = p0 - 1;
                     return true;
                 }
@@ -755,6 +813,18 @@ size_t llama_memory_recurrent::size_s_bytes() const {
     for (const auto & s : s_l) {
         if (s != nullptr) {
             size_s_bytes += ggml_nbytes(s);
+        }
+    }
+
+    for (const auto & ingr : ingr_l) {
+        if (ingr != nullptr) {
+            size_s_bytes += ggml_nbytes(ingr);
+        }
+    }
+
+    for (const auto & ckpt : s_ckpt_l) {
+        if (ckpt != nullptr) {
+            size_s_bytes += ggml_nbytes(ckpt);
         }
     }
 
@@ -1365,6 +1435,35 @@ bool llama_memory_recurrent_context::is_s_copy_main_identity(uint32_t n_seqs) co
         }
     }
     return true;
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_ingr_l(int32_t il) const {
+    if (!mem->gdn_replay || il >= (int32_t) mem->ingr_l.size()) {
+        return nullptr;
+    }
+    return mem->ingr_l[il];
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_s_ckpt_l(int32_t il) const {
+    if (!mem->gdn_replay || il >= (int32_t) mem->s_ckpt_l.size()) {
+        return nullptr;
+    }
+    return mem->s_ckpt_l[il];
+}
+
+uint32_t llama_memory_recurrent_context::get_replay_len() const {
+    if (!mem->gdn_replay || is_full) {
+        return 0;
+    }
+    const llama_ubatch & ubatch = get_ubatch();
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
+        const llama_seq_id seq = ubatch.seq_id_unq[i];
+        if (seq >= 0 && (size_t) seq < mem->replay_len.size()) {
+            m = std::max(m, mem->replay_len[seq]);
+        }
+    }
+    return m;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

@@ -361,6 +361,11 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= rs_z == mctx->get_rs_z();
 
     res &= s_copy_main_identity == mctx->is_s_copy_main_identity(params.ubatch.n_seqs);
+    // DRC phase 2: a nonzero (or changed) replay length needs a differently-shaped extra
+    // reconstruction node in the graph, so it can't be satisfied by reusing existing topology.
+    // Both keys are required: s_copy_main_identity guards the seq_cp path, replay_len the
+    // replay path. Dropping either reuses a graph whose topology no longer matches.
+    res &= replay_len == mctx->get_replay_len();
 
     return res;
 }
@@ -3743,6 +3748,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
     inp->s_copy_main_identity = mctx_cur->is_s_copy_main_identity(n_seqs);
+    inp->replay_len = mctx_cur->get_replay_len();
 
     return inp;
 }

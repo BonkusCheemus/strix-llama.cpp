@@ -92,6 +92,22 @@ Everything else is upstream `llama.cpp`. The additions currently carried here:
 | Vulkan fixes and tuning for RDNA 3.5 | | Driver-gated coopmat LDS stride padding, UMA bulk readback gated on host-cached mappings, IQ3_S mat-vec at batch sizes > 4, and a radix top-k kernel for large k |
 | Hidden server presets | `hidden` in the models `.ini` | Keep a model loadable by name while omitting it from `GET /models` |
 
+**Strix Halo only** (lives here, measured on `gfx1151`)
+
+| Change | Flag / switch | What it does |
+| --- | --- | --- |
+| Multi-point reasoning budget | `--reasoning-budget-*` (upstream has the hard budget only) | Intro message, two soft warnings, a grace period to finish a paragraph after the budget runs out, and reasoning-token usage telemetry |
+| Vulkan batched mat-vec chunking | `GGML_VK_MMV_NO_SPLIT=1` to disable | Dispatches batched mat-vec at the column counts that actually scale on RDNA 3.5, instead of the slow NUM_COLS shader variants |
+| ROCm/HIP quantized matmul on RDNA 3.5 | | MMQ/MMVQ tile configurations and register prefetching, compact `MUL_MAT_ID` with quant- and shape-specific tiles for 256-expert MoE prefill, fused activation quantization for Q8_0 and Q6_K decode |
+| ROCm/HIP MoE decode fusion | `GGML_CUDA_DISABLE_WEIGHTED_DOWN=1`, `GGML_CUDA_DISABLE_MMID_512=1` | Fused routing, weighted expert reduction and shared-expert gate for Qwen3.5/3.6 and Ling style MoE |
+| ROCm/HIP Gated DeltaNet | `GGML_CUDA_DISABLE_GDN_GATE=1` | DPP reductions and a tiled multi-column kernel for prefill; the whole conv -> norm -> gate -> recurrence -> state copy decode chain as one kernel |
+| ROCm/HIP grouped decode matvecs | `GGML_CUDA_DISABLE_MMV_GROUP=1` | Consecutive single-column matvecs that read the same activation (gate/up pairs, hyper-connection projections) launch as one kernel |
+| ROCm/HIP flash attention on RDNA 3.5 | | WMMA path for D=256 prefill at depth, Q8_0 KV tile kernel for decode |
+| Speculative checkpoints on device | | `llama-server` keeps speculative-decoding checkpoints in device memory instead of copying them to the host |
+| ROCmFPx quant types | `llama-quantize` types `Q4_0_ROCMFP4`, `Q4_0_ROCMFP4_FAST`, `Q2/Q3/Q6/Q8_0_ROCMFPX` and the `_LEAN`/`_COHERENT`/`_STRIX` recipes | Loads the ROCmFP4 GGUFs published for Strix Halo. CPU codecs plus Vulkan dequant, mat-vec, matmul and integer-dot kernels; the coopmat2 flash-attention path does not decode them yet |
+| Repeatable output at depth | | Freed KV cells are zeroed so masked-out rows never carry stale K/V, and the Vulkan radix top-k assigns output slots deterministically |
+
+Every ROCm/HIP change above is guarded on architecture, shape and layout, so other devices see upstream behaviour.
 Run `--help`, or see [tools/server/README.md](tools/server/README.md), for the full options.
 
 ## Supported backends
@@ -147,6 +163,8 @@ This is a small community project. A benchmark, a bug report, or a patch is exac
 This project is a fork and owes everything to the people who built what it forks:
 
 - [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) and [ggml](https://github.com/ggml-org/ggml) - Georgi Gerganov and the llama.cpp contributors - MIT license
+- [charlie12345/ROCmFPX](https://github.com/charlie12345/ROCmFPX) - the origin of the ROCmFPx project and the creator of the ROCmFP4 format - MIT license
+- [ciru-ai/ROCmFPX](https://github.com/ciru-ai/ROCmFPX) - a fork of the above, and the tree the ROCmFPx quant formats and reference codecs here were hand-ported from (it shares no git history with llama.cpp, so it cannot be merged) - MIT license
 - [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
 - [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License

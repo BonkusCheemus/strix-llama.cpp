@@ -156,6 +156,8 @@ llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL
 llama_build(test-save-load-state.cpp)
 
+llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)

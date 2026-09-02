@@ -415,6 +415,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
 
+    res &= s_copy_main_identity == mctx->is_s_copy_main_identity(params.ubatch.n_seqs);
+
     return res;
 }
 
@@ -1215,6 +1217,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
+    res &= inp_rs->s_copy_main_identity == mctx->get_recr()->is_s_copy_main_identity(params.ubatch.n_seqs);
+
     return res;
 }
 
@@ -1261,6 +1265,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    res &= inp_rs->s_copy_main_identity == mctx->get_recr()->is_s_copy_main_identity(params.ubatch.n_seqs);
 
     return res;
 }
@@ -1350,6 +1356,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    res &= inp_rs->s_copy_main_identity == mctx->get_recr()->is_s_copy_main_identity(params.ubatch.n_seqs);
 
     return res;
 }
@@ -3809,7 +3817,8 @@ ggml_tensor * llm_graph_context::build_rs(
            uint32_t   rs_head,
            uint32_t   rs_size,
             int32_t   rs_zero,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+       llm_rs_inplace   inplace_mode) const {
 
     GGML_UNUSED(rs_size);
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
@@ -3827,10 +3836,21 @@ ggml_tensor * llm_graph_context::build_rs(
 
     ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
 
-    ggml_tensor * output_states = get_state_rows ?
-        get_state_rows(ctx0, states, state_copy_main) :
-        ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
-    ggml_build_forward_expand(gf, output_states);
+    ggml_tensor * output_states;
+    if (inplace_mode != LLM_RS_INPLACE_NONE) {
+        // the same nodes whether or not the mapping is the identity, only their sizes and sources differ, so a graph
+        // never needs a reallocation the reserve did not plan for. With the identity the ubatch states are already in
+        // place and are read from the cache rows (the gather skipped them); otherwise from the gathered copy.
+        // Not expanded here, so the view stays next to its consumer.
+        output_states = inplace_mode == LLM_RS_INPLACE_IDENTITY ?
+            ggml_view_2d(ctx0, states,     state_size, n_seqs, states->nb[1],     rs_head*states->nb[1]) :
+            ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
+    } else {
+        output_states = get_state_rows ?
+            get_state_rows(ctx0, states, state_copy_main) :
+            ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
+        ggml_build_forward_expand(gf, output_states);
+    }
 
     // copy extra states which won't be changed further (between n_seqs and n_rs)
     ggml_tensor * states_extra = ggml_view_2d(ctx0, states_all, state_size, n_rs - n_seqs, states_all->nb[1], (n_seqs - i0)*states_all->nb[1]);
@@ -3861,6 +3881,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->s_copy_main_identity = mctx_cur->is_s_copy_main_identity(n_seqs);
 
     return inp;
 }
@@ -3878,16 +3899,26 @@ ggml_tensor * llm_graph_context::build_rs(
         ggml_tensor * s,
             int32_t   state_size,
             int32_t   n_seqs,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+               bool   allow_inplace) const {
     const auto * kv_state = inp->mctx;
 
     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
     ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
 
+    // in place: with an identity sequence mapping the ubatch states are not gathered at all, they are read from the
+    // cache rows. The gather is always a view of s_copy, so both mappings build the same nodes
+    llm_rs_inplace inplace_mode = LLM_RS_INPLACE_NONE;
+    if (allow_inplace && !get_state_rows) {
+        inplace_mode = inp->s_copy_main_identity ? LLM_RS_INPLACE_IDENTITY : LLM_RS_INPLACE_COPY;
+        const int64_t i0 = inplace_mode == LLM_RS_INPLACE_IDENTITY ? n_seqs : 0;
+        state_copy = ggml_view_1d(ctx0, inp->s_copy, inp->s_copy->ne[0] - i0, i0*inp->s_copy->nb[0]);
+    }
+
     return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
-                    get_state_rows);
+                    get_state_rows, inplace_mode);
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

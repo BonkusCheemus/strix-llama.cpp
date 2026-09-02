@@ -295,6 +295,9 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // part of the reuse key: a seq_cp between two ubatches can change it
+    bool s_copy_main_identity = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -1007,6 +1010,14 @@ using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 // used in build_rs to properly order writes and avoid unnecessary copies
 using llm_graph_get_rows_fn = std::function<ggml_tensor * (ggml_context *, ggml_tensor * states, ggml_tensor * ids)>;
 
+// how build_rs reads the states of the ubatch: gathered (upstream), or in place on the cache rows when the sequence
+// mapping is the identity, with the same graph nodes for both mappings
+enum llm_rs_inplace {
+    LLM_RS_INPLACE_NONE,
+    LLM_RS_INPLACE_COPY,
+    LLM_RS_INPLACE_IDENTITY,
+};
+
 struct llm_graph_qkv {
     ggml_tensor * q; // [n_embd_head, n_head,    n_tokens]
     ggml_tensor * k; // [n_embd_head, n_head_kv, n_tokens]
@@ -1398,16 +1409,20 @@ struct llm_graph_context {
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr,
+           llm_rs_inplace   inplace_mode = LLM_RS_INPLACE_NONE) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 
+    // allow_inplace: when no state is copied, return a view of the cache rows instead of a get_rows copy
+    // the consumer must read the whole state before the write-back cpy
     ggml_tensor * build_rs(
             llm_graph_input_rs * inp,
             ggml_tensor * s,
                 int32_t   state_size,
                 int32_t   n_seqs,
-            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr,
+                   bool   allow_inplace = false) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

@@ -343,6 +343,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+
+    mctx->consume_replay_len();
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -1141,6 +1143,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    mctx->get_recr()->consume_replay_len();
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1164,6 +1168,10 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
     res &= inp_rs->s_copy_main_identity == mctx->get_recr()->is_s_copy_main_identity(params.ubatch.n_seqs);
+    // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
+    // differently-shaped reconstruction subtree, which reused topology cannot express.
+    // Both are reuse-key terms; each guards a different topology change.
+    res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
 
     return res;
 }
@@ -1192,6 +1200,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    mctx->get_recr()->consume_replay_len();
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1214,6 +1224,10 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
     res &= inp_rs->s_copy_main_identity == mctx->get_recr()->is_s_copy_main_identity(params.ubatch.n_seqs);
+    // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
+    // differently-shaped reconstruction subtree, which reused topology cannot express.
+    // Both are reuse-key terms; each guards a different topology change.
+    res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
 
     return res;
 }
@@ -1270,6 +1284,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    mctx->get_recr()->consume_replay_len();
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1306,6 +1322,10 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
     res &= inp_rs->s_copy_main_identity == mctx->get_recr()->is_s_copy_main_identity(params.ubatch.n_seqs);
+    // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
+    // differently-shaped reconstruction subtree, which reused topology cannot express.
+    // Both are reuse-key terms; each guards a different topology change.
+    res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
 
     return res;
 }

@@ -1466,6 +1466,23 @@ uint32_t llama_memory_recurrent_context::get_replay_len() const {
     return m;
 }
 
+void llama_memory_recurrent_context::consume_replay_len() const {
+    if (!mem->gdn_replay || is_full) {
+        return;
+    }
+    const llama_ubatch & ubatch = get_ubatch();
+    for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
+        const llama_seq_id seq = ubatch.seq_id_unq[i];
+        if (seq >= 0 && (size_t) seq < mem->replay_len.size()) {
+            mem->replay_len[seq] = 0;
+        }
+    }
+}
+
+// NOTE: 4d485aa40 also carries a get_p_l() definition here, but our tree already defines
+// it at :1422 (the PLE accessor). Both sides of the merge legitimately have it, because
+// upstream's commits were authored on a tree that already contained our PLE work.
+// Taking theirs verbatim would define it twice; the earlier definition is kept.
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;

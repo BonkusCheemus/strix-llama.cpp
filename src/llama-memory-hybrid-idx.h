@@ -188,6 +188,18 @@ public:
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
+    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
+    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
+    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
+    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
+    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
+    //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
+    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
+    // the caller then adds the attention mask, the only part of the bias that varies within a block
+    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       bool blk_bias) const;
+
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.

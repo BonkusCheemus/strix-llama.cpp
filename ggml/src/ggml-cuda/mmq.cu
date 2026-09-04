@@ -41,9 +41,15 @@ static int ggml_cuda_mmq_rdna3_5_fixed_J(
     if ((type == GGML_TYPE_Q5_K && use_rdna3_5_q5_ling(a)) || use_rdna3_5_q6_ling_j32(a)) {
         return 32;
     }
-    // 256-expert MoE: narrow J by rows per expert, run through the routed-compact kernel
-    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback && ids != nullptr && nchannels_y == 256) {
-        return mmq_rdna3_5_id_get_J(type, (ncols_dst + nchannels_y - 1) / nchannels_y);
+    // MoE: narrow J by rows per expert, run through the routed-compact kernel
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback && ids != nullptr && mmq_rdna3_5_id_n_experts_ok(nchannels_y)) {
+        const int64_t rows_per_expert = (ncols_dst + nchannels_y - 1) / nchannels_y;
+        int J = type == GGML_TYPE_Q6_K && nchannels_y == 128 && rows_per_expert >= 96 && rows_per_expert <= 160 ?
+            48 : mmq_rdna3_5_id_get_J(type, rows_per_expert);
+        if (type == GGML_TYPE_Q6_K && getenv("GGML_Q6_COMPACT_J")) {
+            J = atoi(getenv("GGML_Q6_COMPACT_J"));
+        }
+        return J;
     }
     return 0;
 }
@@ -386,7 +392,7 @@ static void ggml_cuda_mul_mat_q_impl(
     const ggml_tensor * gate = swiglu ? swiglu->src[0] : nullptr;
     const ggml_tensor * up   = swiglu ? swiglu->src[1] : nullptr;
     if (swiglu) {
-        GGML_ASSERT(src0->type == GGML_TYPE_Q8_0);
+        GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_IQ4_NL);
         GGML_ASSERT(gate && up && gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, src1));
     }
@@ -621,6 +627,7 @@ void ggml_cuda_mul_mat_q_swiglu(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * swiglu) {
     ggml_cuda_mul_mat_q_impl(ctx, src0, swiglu, ids, dst, swiglu);
 }
+
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS

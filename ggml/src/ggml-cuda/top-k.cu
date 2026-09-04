@@ -25,6 +25,10 @@
 #endif // GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS
 
 #ifdef GGML_CUDA_USE_CUB
+#    ifdef GGML_CUDA_CUB_IS_HIPCUB
+#        include <hipcub/hipcub.hpp>
+namespace cub = hipcub;
+#    else
 #    include <cub/cub.cuh>
 // DeviceTopK has a race condition before CCCL 3.4.3.
 // https://github.com/NVIDIA/cccl/pull/10627
@@ -35,6 +39,7 @@
 #        include <cuda/iterator>
 using namespace cub;
 #    endif  // CCCL >= 3.4.3
+#    endif  // GGML_CUDA_CUB_IS_HIPCUB
 #endif      // GGML_CUDA_USE_CUB
 
 // max rows for the per-row DeviceTopK / CUB argsort path before switching to radix / bitonic

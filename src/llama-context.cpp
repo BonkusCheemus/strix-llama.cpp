@@ -1911,6 +1911,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+
+    {   // warm the page cache for this batch's per-layer-embedding rows while the first chunk is on the GPU;
+        // posix_fadvise only, so a wrong prediction costs readahead and nothing else
+        extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens);
+        // llama_batch_ext keeps tokens as entries; the allocator's flat view has the token IDs
+        const llama_batch & flat = balloc->get_batch();
+        if (model.arch == LLM_ARCH_QWEN4EXP && flat.token && flat.n_tokens >= 4096) {
+            qwen4exp_ple_prefetch(model, flat.token, flat.n_tokens);
+        }
+    }
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
     if (output_all) {

@@ -167,6 +167,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build_and_test(test-qsa-prefix.cpp)
+llama_build_and_test(test-ple-disk.cpp)
 # llama_context state tests: KV and recurrent state save, load, copy, rollback
 set(LLAMA_CONTEXT_TEST_SRC
     test-llama-context.cpp

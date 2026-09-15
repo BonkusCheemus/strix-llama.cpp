@@ -232,18 +232,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             ple_rows = ple_w->tensor->ne[1];
         }
 
-        // on disk the tensor is counted as created but never allocated, mapped or read: each
-        // ubatch preads exactly the rows it gathers (llm_graph_input_ple::set_input). A model
-        // with no tensor to read from stays on the lazy path.
-        // --lazy-mode on-direct is the same reader through the page cache (explicit preads instead of
-        // demand paging the mmap), with the --ngram-* settings if given
-        const bool ple_on_disk = params.ple_on_disk || params.lazy_mode == LLAMA_LAZY_MODE_DIRECT;
+        // --lazy-mode on-direct: the tensor is counted as created but never allocated, mapped or read; each
+        // ubatch preads exactly the rows it gathers (llm_graph_input_ple::set_input) through the page cache.
+        // A model with no tensor to read from stays on the lazy path.
+        const bool ple_on_disk = params.lazy_mode == LLAMA_LAZY_MODE_DIRECT;
 
         if (ple_on_disk && ple_w) {
             llama_ple_disk::params dp;
-            dp.n_threads   = params.ple_io_threads;
-            dp.cache_bytes = params.ple_cache_mb > 0 ? (size_t) params.ple_cache_mb << 20 : 0;
-            dp.direct_io   = params.ple_on_disk ? params.ple_direct_io : false;
+            dp.direct_io = false; // page-cached, so qwen4exp_ple_prefetch's readahead advice can land
+            if (const char * e = getenv("LLAMA_PLE_DIRECT")) { dp.direct_io = atoi(e) != 0; }
 
             ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w->idx), ple_w->offs,
                                                         ple_w->tensor->type, ple_w->tensor->ne[0], ple_rows, dp);

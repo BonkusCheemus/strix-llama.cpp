@@ -388,7 +388,9 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_n_rs();
 
-    if (s_copy) {
+    // a graph with no recurrent layers (the qwen4exp draft block on a hybrid-idx memory) never consumes the copy
+    // map, so the scheduler leaves it unallocated
+    if (s_copy && s_copy->buffer) {
         llama_host_write(s_copy);
         int32_t * data = (int32_t *) s_copy->data;
 
@@ -1181,7 +1183,9 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // a graph with no recurrent layers (the qwen4exp draft block on a hybrid-idx memory) never consumes the copy
+    // map, so the scheduler leaves it unallocated
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         llama_host_write(inp_rs->s_copy);
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1227,7 +1231,9 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // a graph with no recurrent layers (the qwen4exp draft block on a hybrid-idx memory) never consumes the copy
+    // map, so the scheduler leaves it unallocated
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         llama_host_write(inp_rs->s_copy);
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1300,7 +1306,9 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // a graph with no recurrent layers (the qwen4exp draft block on a hybrid-idx memory) never consumes the copy
+    // map, so the scheduler leaves it unallocated
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         llama_host_write(inp_rs->s_copy);
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 

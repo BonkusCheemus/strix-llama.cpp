@@ -64,6 +64,13 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // TurboQuant KV: rotation matrices and per-channel Q/V scale. Default: none.
+    // Only a turbo-type cache overrides these; every other cache returns nullptr
+    // and the graph skips the rotation entirely.
+    virtual ggml_tensor * get_turbo_rot_forward()      const { return nullptr; }
+    virtual ggml_tensor * get_turbo_rot_inverse()      const { return nullptr; }
+    virtual ggml_tensor * get_turbo_innerq_scale_inv() const { return nullptr; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

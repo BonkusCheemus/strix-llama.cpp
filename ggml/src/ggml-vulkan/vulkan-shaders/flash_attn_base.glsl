@@ -95,7 +95,6 @@ layout (binding = 7) readonly buffer KVB {uint32_t data_kv_dyn[];};
 #define BINDING_IDX_V 1
 
 #include "fa_types.glsl"
-
 #if defined(BFLOAT16)
 #define O_TYPE float
 #define O_TYPEV4 vec4

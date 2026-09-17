@@ -12,6 +12,13 @@
 #define FA_TYPE_Q8_0  8u
 #define FA_TYPE_IQ4_NL 20u
 #define FA_TYPE_BF16 30u
+#define FA_TYPE_Q1_0 41u
+#define FA_TYPE_Q2_0 42u
+#define FA_TYPE_TURBO2_0 43u
+#define FA_TYPE_TURBO3_0 44u
+#define FA_TYPE_TQ3_1S 45u
+#define FA_TYPE_TQ4_1S 46u
+#define FA_TYPE_TURBO4_0 47u
 
 // Number of matrix elements per buffer block, derived from the K/V type spec
 // constant. F32 is treated as a vec4 "block" of 4 floats. F16 uses block size 1
@@ -26,7 +33,12 @@ uint fa_block_elems(uint ty) {
         case FA_TYPE_Q5_1: return uint(QUANT_K_Q5_1);
         case FA_TYPE_Q8_0: return uint(QUANT_K_Q8_0);
         case FA_TYPE_IQ4_NL: return uint(QUANT_K_IQ4_NL);
-        case FA_TYPE_BF16: return 1u;
+        case FA_TYPE_BF16: return 1u;        case FA_TYPE_Q1_0:  return uint(QUANT_K_Q1_0);
+        case FA_TYPE_Q2_0:  return uint(QUANT_K_Q2_0);
+        case FA_TYPE_TURBO2_0: return uint(QUANT_K_TURBO2_0);
+        case FA_TYPE_TURBO3_0: return uint(QUANT_K_TURBO3_0);
+        case FA_TYPE_TURBO4_0: return uint(QUANT_K_TURBO4_0);
+
         default:           return 1u;
     }
 }

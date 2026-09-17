@@ -751,9 +751,7 @@ void llama_context::sched_reserve() {
             moe_cache_eligible ? moe_cache_requested : "off");
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    ggml_backend_sched_set_moe_cache(
-            sched.get(), moe_cache_mode,
-            cparams.moe_cache_budget_mib);
+    /* moe-cache sched wiring not ported with turbo KV; DRC feature stays off */
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -843,9 +841,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                ggml_backend_sched_set_moe_cache(
-                        sched.get(), moe_cache_mode,
-                        cparams.moe_cache_budget_mib);
+                /* moe-cache sched wiring not ported with turbo KV; DRC feature stays off */
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -3975,8 +3971,8 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
-        /*.sampler                     =*/ nullptr,
-        /*.n_sampler                   =*/ 0,
+        /*.samplers                    =*/ nullptr,
+        /*.n_samplers                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
     };
 

@@ -36,6 +36,11 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
+    // fork DRC plumbing (inert unless its features are wired; turbo port needs the members to exist)
+    bool gdn_replay = false;      // ingredient-replay rollback for GDN models
+    int  moe_cache_mode = 0;      // LLAMA_MOE_CACHE_MODE_OFF by default
+    int  moe_cache_budget_mib = 0;
+    bool mtp_chain = false;       // chained MTP draft decode
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;

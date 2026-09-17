@@ -13,6 +13,7 @@
 #include "ggml-backend-sanitize.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-backend-moe-cache.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -22,6 +23,8 @@
 #include <string.h>
 #include <algorithm>
 #include <unordered_map>
+#include <mutex>
+#include <vector>
 #include <vector>
 
 #ifdef __APPLE__
@@ -526,6 +529,62 @@ ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend) {
 }
 
 // backend copy
+
+static std::mutex g_moe_cache_registry_mu;
+static std::vector<ggml_moe_cache_api> g_moe_cache_providers;
+
+void ggml_moe_cache_register(const ggml_moe_cache_api * api) {
+    if (!api || !api->owner || !api->session_create || !api->session_destroy ||
+        !api->session_enter || !api->session_leave) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    for (ggml_moe_cache_api & existing : g_moe_cache_providers) {
+        if (existing.owner == api->owner) {
+            existing = *api; // refresh: a rebuilt library re-registers
+            return;
+        }
+    }
+    g_moe_cache_providers.push_back(*api);
+}
+
+void ggml_moe_cache_unregister(const void * owner) {
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    g_moe_cache_providers.erase(
+        std::remove_if(g_moe_cache_providers.begin(), g_moe_cache_providers.end(),
+            [owner](const ggml_moe_cache_api & api) { return api.owner == owner; }),
+        g_moe_cache_providers.end());
+}
+
+ggml_moe_cache_api ggml_moe_cache_get(const void * owner) {
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    for (const ggml_moe_cache_api & api : g_moe_cache_providers) {
+        if (api.owner == owner) {
+            return api;
+        }
+    }
+    return ggml_moe_cache_api{};
+}
+
+// The provider table the current thread is executing under. Set by the
+// scheduler scope while a graph with a cache session runs; the CPU backend
+// reads it to reach the session's provider callbacks.
+static thread_local ggml_moe_cache_api t_moe_cache_active;
+
+ggml_moe_cache_api ggml_moe_cache_active(void) {
+    if (t_moe_cache_active.owner) {
+        return t_moe_cache_active;
+    }
+    // Direct CPU users outside a scheduler scope fall back to the first
+    // registered provider.
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    for (const ggml_moe_cache_api & api : g_moe_cache_providers) {
+        if (api.session_create && api.session_destroy) {
+            return api;
+        }
+    }
+    return ggml_moe_cache_api{};
+}
 
 void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");

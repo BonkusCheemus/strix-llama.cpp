@@ -330,14 +330,11 @@ struct llama_hparams {
     // TODO: can be expressed via the `new n_embd_inp_impl` and remove this param
     uint32_t n_deepstack_layers = 0;
 
-    // deepstack layer array (Granite4 Vision)
-    // -1  => no deepstack
-    // >=0 => input embedding index for deepstack injection
+    // deepstack layer array (Granite4 Vision): -1 => none, >=0 => input embedding index
     std::array<int32_t, LLAMA_MAX_LAYERS> deepstack_mapping_arr;
 
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
-
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141
     llama_token dec_start_token_id = LLAMA_TOKEN_NULL;
@@ -444,6 +441,10 @@ struct llama_hparams {
     // dimension of the recurrent state embeddings
     uint32_t n_embd_s() const;
 
+    // dimension of one ggml_gated_delta_net emit_mode==1 ingredient slot (4 rows of head_dim,
+    // one each for k/v/g/beta) -- only meaningful for GDN/KDA-style layers (n_embd_head_kda != 0).
+    uint32_t n_embd_s_ingredient() const;
+
     uint32_t n_pos_per_embd() const;
 
     // note: currently only support if either all or none of the layers are MLA
@@ -458,7 +459,10 @@ struct llama_hparams {
 
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
+    // number of layers with KV cache
+    uint32_t n_layer_kv() const;
 
+    // number of layers with KV cache
     // note that this function uses different SWA parameters from those in the hparams
     // note: inlined on purpose for performance reasons
     // TODO: think of a better place for this function
@@ -501,6 +505,15 @@ struct llama_hparams {
 
 
     bool use_mrope() const;
+
+    // EAGLE3 draft model
+    std::array<int, 3> eagle3_extract_layers = {0, 0, 0};
+    uint32_t eagle3_target_hidden_size    = 0;
+    bool     eagle3_norm_before_residual  = false;
+
+
+
+
 };
 
 static_assert(std::is_trivially_copyable<llama_hparams>::value, "llama_hparams must be trivially copyable");

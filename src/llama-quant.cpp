@@ -253,24 +253,7 @@ static void llama_tensor_dequantize_impl(
 
     size_t block_size_bytes = ggml_type_size(type);
 
-    GGML_ASSERT(first_elem % block_size == 0);
     GGML_ASSERT(nelements % block_size == 0);
-
-    uint8_t * f32_input = (uint8_t *) tensor->data + (first_elem / block_size) * block_size_bytes;
-
-    if (nthread < 2) {
-        if (tensor->type == GGML_TYPE_F16) {
-            ggml_fp16_to_fp32_row((ggml_fp16_t *)f32_input, f32_output, nelements);
-        } else if (tensor->type == GGML_TYPE_BF16) {
-            ggml_bf16_to_fp32_row((ggml_bf16_t *)f32_input, f32_output, nelements);
-        } else if (ggml_is_quantized(tensor->type)) {
-            qtype->to_float(f32_input, f32_output, nelements);
-        } else {
-            GGML_ABORT("fatal error"); // unreachable
-        }
-        return;
-    }
-
     size_t nblocks = nelements / block_size;
     size_t blocks_per_thread = nblocks / nthread;
     size_t spare_blocks = nblocks - (blocks_per_thread * nthread); // if blocks aren't divisible by thread count

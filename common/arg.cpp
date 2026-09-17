@@ -375,10 +375,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
 
     const bool spec_type_draft_mtp = std::find(params.speculative.types.begin(),
                                         params.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end() ||
-                                     std::find(params.speculative.types.begin(),
-                                        params.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
@@ -1343,11 +1340,6 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         if (ctx_arg.params.completion) {
             common_params_print_completion(ctx_arg);
             exit(0);
-        }
-
-        const bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
-        if (adaptive_mtp && (params.speculative.draft.n_min_adaptive < 1 || params.speculative.draft.n_min_adaptive > params.speculative.draft.n_max)) {
-            throw std::invalid_argument("error: --spec-draft-n-min-adaptive must be in [1, --spec-draft-n-max]");
         }
 
         params.lr.init();
@@ -4417,14 +4409,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.synth_rates = std::move(rates);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
-
-    add_opt(common_arg(
-        {"--spec-draft-n-min-adaptive"}, "N",
-        string_format("minimum adaptive MTP draft depth; the depth starts here and never drops below it (default: %d)", params.speculative.draft.n_min_adaptive),
-        [](common_params & params, int value) {
-            params.speculative.draft.n_min_adaptive = value;
-        }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
 
     add_opt(common_arg(
         {"--spec-chain"}, "0|1|N",

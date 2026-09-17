@@ -926,6 +926,7 @@ public:
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
+    std::vector<llm_graph_fused_node> fused_nodes;
     void set_params(const llm_graph_params & params);
 
 

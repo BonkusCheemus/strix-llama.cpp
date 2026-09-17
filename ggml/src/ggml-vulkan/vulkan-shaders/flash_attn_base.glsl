@@ -89,7 +89,6 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #define BINDING_IDX_V 1
 
 #include "fa_types.glsl"
-
 #if defined(BFLOAT16)
 #define O_TYPE float
 #define O_TYPEV4 vec4

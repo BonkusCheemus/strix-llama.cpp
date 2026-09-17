@@ -302,6 +302,9 @@ struct handle_model_result {
 };
 
 const std::vector<ggml_type> kv_cache_types = {
+    GGML_TYPE_TURBO2_0,
+    GGML_TYPE_TURBO3_0,
+    GGML_TYPE_TURBO4_0,
     GGML_TYPE_F32,
     GGML_TYPE_F16,
     GGML_TYPE_BF16,

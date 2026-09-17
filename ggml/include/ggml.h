@@ -429,6 +429,14 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
+        GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV cache: WHT + 2-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_TURBO3_0 = 44, // TurboQuant 3-bit KV cache: WHT + 3-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_TQ3_1S  = 45, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
+        GGML_TYPE_TQ4_1S  = 46, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
+        GGML_TYPE_TURBO4_0 = 47, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_Q8_CR   = 48, // Q8_0 blocks of a ConvRot-rotated tensor
+        GGML_TYPE_Q5_CR   = 49, // Q5_0 blocks of a ConvRot-rotated tensor
+        GGML_TYPE_Q6_CR   = 50, // Q6_K blocks of a ConvRot-rotated tensor
         GGML_TYPE_Q2_0    = 42,
         // ROCmFPx experimental AMD-native formats. These are kept in a high ID
         // range so upstream type IDs stay free for future ggml types.
@@ -498,6 +506,9 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX          = 111, // ROCmFPx experimental 8-bit reference layout
         GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX          = 112, // ROCmFPx experimental 3-bit reference layout
         GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX          = 113, // ROCmFPx experimental 2-bit S40 codebook layout
+        GGML_FTYPE_MOSTLY_Q8_CR   = 29, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q5_CR   = 30, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q6_CR   = 31, // except 1d tensors
     };
 
     // available tensor operations:
@@ -593,6 +604,7 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_TURBO_WHT,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -2620,9 +2632,29 @@ extern "C" {
     //   beta  : [1, H_v, n_tokens, n_seqs]
     //   state : [S_v, S_v, H_v, n_seqs] -- initial recurrent state s0
     //
-    // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
+    // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K trailing
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    //
+    // emit_mode selects what a snapshot slot holds:
+    //   0 (default) - a full recurrent state [S_v, S_v, H_v] per slot, as above.
+    //   1 (ingredients) - the small per-token (k, v, g, beta) that produced that step's state,
+    //     each broadcast/padded to width S_v, packed as 4 rows of [S_v, H_v] per slot (k, v, g,
+    //     beta in that order), followed by ONE extra full [S_v, S_v, H_v] block (same layout as
+    //     emit_mode == 0's slot 0) holding the true final state after all n_tokens -- a fixed
+    //     once-per-call cost, not scaled by K. Replaying the K ingredients through another call to
+    //     this op with K == 1, using the checkpoint state s tokens back as `state`, reconstructs
+    //     the same state as that trailing final-state block (or as slot 0 of the emit_mode == 0
+    //     output) -- at O(S_v) storage per retained step instead of O(S_v^2), since q is not
+    //     needed to reconstruct state (only to produce attention output, which the replay caller
+    //     is expected to discard). When n_tokens > K, ONE further extra full [S_v, S_v, H_v] block
+    //     follows the final-state block: the state after processing the first (n_tokens - K)
+    //     tokens, i.e. immediately before the K-token retained window starts -- also a fixed,
+    //     once-per-call cost. This lets a caller replaying a partial-accept rollback start from
+    //     "the state before the whole uncertain window" without a second op call to recompute it:
+    //     the recurrence already passes through that exact intermediate value on its way to the
+    //     final state, so capturing it here is free relative to a separate K=1 call over the same
+    //     prefix. Omitted (and not counted in the output size) when n_tokens <= K.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2631,19 +2663,20 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
-            int64_t               K);
+            int64_t               K,
+            int32_t               emit_mode);
 
-    // DSA lightning indexer
-    //
-    // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
-    // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
-    // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
-    // mask:    [n_kv,       n_batch,    1,       ne33] !! f16 !!
-    // res:     [n_kv,       n_batch,    1,       ne3 ]
-    //
-    // broadcast:
-    //   ne3 % ne33 == 0
-    //
+    // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
+    // Applies WHT rotation to 128-element groups along ne[0]: sign1 → butterfly → sign2 → normalize
+    // direction: 0 = forward (signs1 → WHT → signs2), 1 = inverse (signs2 → WHT → signs1)
+    GGML_API struct ggml_tensor * ggml_turbo_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   direction,
+            int                   group_size,    // 0 = auto (64 or 128 from ne[0])
+            struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
+
+    // DeepSeek V4 Lightning Indexer
     GGML_API struct ggml_tensor * ggml_lightning_indexer(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -2652,8 +2685,6 @@ extern "C" {
         struct ggml_tensor  * mask);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
-    // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
-    // using a richer representation through streams.
     //
     // hc_comb: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
     //          -> [dst_hc, src_hc, n_tokens]
@@ -2677,11 +2708,9 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * weights);
 
-    // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
-    //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
+    // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens], post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
     //          -> [n_embd, hc, n_tokens]
-    //   result[i, dst, t] = x[i, t]*post[dst, t]
-    //                       + sum_src residual[i, src, t]*comb[dst, src, t]
+    //   result[i, h, t] = x[i, t] * post[h, t] + sum_src residual[i, src, t] * comb[h, src, t]
     //
     GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
             struct ggml_context * ctx,

@@ -113,7 +113,10 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
+<<<<<<< ours
         // a model can hold more than one cache, so the tensor names have to stay unique
+=======
+>>>>>>> theirs
                  const char *   name_tag = "");
 
     ~llama_kv_cache() override;
@@ -157,27 +160,43 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
+    std::vector<uint32_t> get_layer_ids() const;
+    ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
+    bool get_v_transposed() const;
 
     bool get_has_shift() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
 
-    std::vector<uint32_t> get_layer_ids() const;
-    ggml_tensor * get_k_storage(int32_t il) const;
-
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+<<<<<<< ours
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
     //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
     //   sinfos_in : if set, the layout to use instead of searching. one entry per stream, cell count must match the blob
+=======
+    // state_read, plus the cells the restored tokens were placed in.
+    // a cache that mirrors another one cell for cell (the qwen4exp indexer) cannot search for
+    // its own cells here: a second independent search only happens to agree with the first.
+    //   sinfos_out: if set, resized to n_stream and filled with the layout used; a stream that
+    //               carried no cells leaves an empty entry
+    //   sinfos_in : if set, the layout to use instead of searching for one. it must have one
+    //               entry per stream and the entry must match the cell count in the blob,
+    //               otherwise the read fails as it would on any other corrupt input
+>>>>>>> theirs
     void state_read_sinfo(
             llama_io_read_i & io,
                llama_seq_id   seq_id,
       llama_state_seq_flags   flags,
           slot_info_vec_t *   sinfos_out,
+<<<<<<< ours
     const slot_info_vec_t *   sinfos_in);
+=======
+     const slot_info_vec_t *   sinfos_in);
+>>>>>>> theirs
 
     //
     // graph_build API
@@ -189,6 +208,7 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+<<<<<<< ours
     // zero the K rows (and the V rows when V is stored row-major) [r0, r1) of stream strm in
     // every layer, including the layers of the caches that mirror these cells (sharers).
     // Called for every cell that becomes free, so a masked-out cell never holds stale content:
@@ -196,6 +216,16 @@ public:
     // otherwise depend on whatever the masked-out cells last held.
     void zero_rows(uint32_t strm, uint32_t r0, uint32_t r1);
     void zero_idxs(uint32_t strm, const std::vector<uint32_t> & idxs);   // ascending cell indices
+=======
+    // TurboQuant: get rotation matrices (stored as row-major C arrays)
+    // turbo_rotation = R (forward rotation, for Q pre-rotate-queries)
+    // turbo_rotation_inv = R^T = R^{-1} (inverse rotation, for V output un-rotation)
+    ggml_tensor * get_turbo_rotation() const { return turbo_rotation; }
+    ggml_tensor * get_turbo_rotation_inv() const { return turbo_rotation_inv; }
+
+    // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
+    ggml_tensor * get_turbo_innerq_scale_inv() const { return turbo_innerq_scale_inv; }
+>>>>>>> theirs
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -326,6 +356,13 @@ private:
 
     std::vector<kv_layer> layers;
 
+    // TurboQuant rotation matrices (128x128, row-major stored)
+    ggml_tensor * turbo_rotation = nullptr;      // R (forward rotation)
+    ggml_tensor * turbo_rotation_inv = nullptr;   // R^T = R^{-1} (inverse rotation)
+
+    // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization (128 floats)
+    ggml_tensor * turbo_innerq_scale_inv = nullptr;
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
@@ -413,6 +450,17 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    // TurboQuant rotation accessors
+    ggml_tensor * get_turbo_rotation() const;
+    ggml_tensor * get_turbo_rotation_inv() const;
+
+    // Override virtual methods from llama_memory_context_i
+    ggml_tensor * get_turbo_rot_forward() const override;
+    ggml_tensor * get_turbo_rot_inverse() const override;
+
+    // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
+    ggml_tensor * get_turbo_innerq_scale_inv() const override;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

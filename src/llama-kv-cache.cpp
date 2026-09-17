@@ -139,13 +139,11 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
-<<<<<<< ours
     if (other) {
         // our rows go stale exactly when the owner frees a cell: let it zero them with its own
         other->sharers.push_back(this);
     }
 
-=======
     // Auto-asymmetric: when symmetric turbo K+V is requested and the model has
     // high GQA ratio (few KV heads serving many Q heads), upgrade K to q8_0.
     // Turbo K quantization error gets amplified by the GQA broadcast factor.
@@ -183,7 +181,6 @@ llama_kv_cache::llama_kv_cache(
     // #24060/MTP fix: iterate ALL layers (incl. nextn) so an all-nextn draft
     // (gemma4-assistant: n_layer()==0) registers its KV layers; has_kv() still
     // gates per-layer. Upstream loops the full hparams.n_layer member here.
->>>>>>> theirs
     const uint32_t n_layer = hparams.n_layer_all;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -428,12 +425,9 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-<<<<<<< ours
-=======
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, kv_size, n_stream) : nullptr;
 
->>>>>>> theirs
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
 
@@ -577,7 +571,6 @@ llama_kv_cache::llama_kv_cache(
         // LLAMA_ATTN_ROT_DISABLE retained as a hard lock-out: =1 forces rotation
         // off on both sides and blocks the per-side overrides below.
         const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
-<<<<<<< ours
         const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
         if (attn_rot_disable) {
             LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
@@ -612,42 +605,6 @@ llama_kv_cache::llama_kv_cache(
             n_embd_head_v_all > 0 &&
             ggml_is_quantized(type_v) &&
             hparams.n_embd_head_v() % 64 == 0;
-=======
-        const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? (atoi(LLAMA_ATTN_ROT_DISABLE) != 0) : false;
-
-        // Default: rotation OFF on both sides (safe across all tested model families).
-        // Override per side via env vars below.
-        attn_rot_k = false;
-        attn_rot_v = false;
-
-        // Per-side overrides. Set LLAMA_ATTN_ROT_K_OVERRIDE=1 / LLAMA_ATTN_ROT_V_OVERRIDE=1
-        // to enable rotation. The cache type and head-dim alignment guards below
-        // still apply: rotation only takes effect on quantized types with
-        // head_dim % 64 == 0 (master's #21038 requirements).
-        const char * ROT_K_OV = getenv("LLAMA_ATTN_ROT_K_OVERRIDE");
-        if (ROT_K_OV && atoi(ROT_K_OV) != 0 && !attn_rot_disable) {
-            attn_rot_k =
-                n_embd_head_k_all > 0 &&
-                ggml_is_quantized(type_k) &&
-                hparams.n_embd_head_k() % 64 == 0;
-        }
-        const char * ROT_V_OV = getenv("LLAMA_ATTN_ROT_V_OVERRIDE");
-        if (ROT_V_OV && atoi(ROT_V_OV) != 0 && !attn_rot_disable) {
-            attn_rot_v =
-                n_embd_head_v_all > 0 &&
-                ggml_is_quantized(type_v) &&
-                hparams.n_embd_head_v() % 64 == 0;
-        }
-
-        // always create Hadamard rotation tensors for DeepSeek V3.2 DSA lightning
-        // indexer: this is a functional requirement for the model, not optional
-        // tuning, so it overrides the default-off policy (still respects the hard
-        // LLAMA_ATTN_ROT_DISABLE lock-out).
-        if (!attn_rot_disable && (model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4) &&
-            hparams.n_embd_head_k_full == hparams.indexer_head_size) {
-            attn_rot_k = true;
-        }
->>>>>>> theirs
     }
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
@@ -2318,16 +2275,13 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
-<<<<<<< ours
     llama_host_write(dst);
-=======
     if (!dst) {
         // rotation disabled for this cache (attn_rot_k == false): the graph
         // never created the input tensor — nothing to fill.
         return;
     }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
->>>>>>> theirs
 
     const auto n_rot = dst->ne[0];
     GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
@@ -2511,14 +2465,11 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
         kv_self->set_input_k_shift(k_shift);
     }
 
-<<<<<<< ours
-=======
     // k_rot is null (not just unallocated) whenever attn_rot_k is false: build_input_k_rot
     // only allocates a real tensor for quantized K-caches with rotation enabled, or for
     // DeepSeek32/DeepSeek4's lightning-indexer cache (see attn_rot_k's setup). So a skip
     // here is either "this cache doesn't rotate" (k_rot == nullptr) or "graph-reserve pass"
     // (k_rot->buffer == nullptr) -- never a case that should silently drop a real input.
->>>>>>> theirs
     if (k_rot && k_rot->buffer) {
         kv_self->set_input_k_rot(k_rot);
     }
@@ -2681,14 +2632,8 @@ const slot_info_vec_t *   sinfos_in) {
         throw std::runtime_error("n_stream mismatch");
     }
 
-<<<<<<< ours
     // a whole-context restore replaces every stream, so the cache is emptied once here
     // clear() resets all streams at once, so doing it per stream below would keep only the last one
-=======
-    // a whole-context restore replaces every stream, so the cache is emptied once here. clear()
-    // resets all streams at once, so doing this per stream below would throw away the streams
-    // already read and leave only the last one
->>>>>>> theirs
     if (seq_id == -1) {
         clear(true);
     }
@@ -2879,11 +2824,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         // the ext as it was saved, to put back after apply_ubatch()
         std::vector<llama_kv_cell_ext> exts;
-<<<<<<< ours
         if (has_cell_ext()) {
-=======
-        if (hparams.n_pos_per_embd() > 1) {
->>>>>>> theirs
             exts.resize(cell_count);
         }
 
@@ -2903,7 +2844,6 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
 
-<<<<<<< ours
                 if (hparams.n_pos_per_embd() > 1) {
                     ubatch.pos[i + ubatch.n_tokens]   = ext.y;
                     ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
@@ -2911,10 +2851,6 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
                 // apply_ubatch() below restores ext.tok from the ubatch tokens
                 ubatch.token[i] = ext.tok;
-=======
-                ubatch.pos[i + ubatch.n_tokens]   = ext.y;
-                ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
->>>>>>> theirs
 
                 exts[i] = ext;
             }
@@ -2931,12 +2867,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         }
 
         if (sinfo_in) {
-<<<<<<< ours
             // this cache mirrors another one, so it takes that cache's layout instead of searching for its own cells
-=======
-            // this cache mirrors another one, so it takes that cache's restored layout rather
-            // than searching for cells of its own
->>>>>>> theirs
             if (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != cell_count) {
                 LLAMA_LOG_ERROR("%s: mirrored slot layout holds %d cells, this cache restores %d\n", __func__,
                         sinfo_in->empty() ? 0 : (int) sinfo_in->idxs[0].size(), cell_count);
@@ -2945,23 +2876,13 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             sinfo = *sinfo_in;
 
-<<<<<<< ours
             // the layout is cell indices, so it means the same in both caches only while their streams line up
-=======
-            // the layout is addressed by cell index, so it only means the same thing in both
-            // caches while their streams line up
->>>>>>> theirs
             sinfo.s0 = strm;
             sinfo.s1 = strm;
             sinfo.strm[0] = strm;
 
-<<<<<<< ours
             // seq_rm above freed exactly the cells this sequence held
             // anything else in the way is a cache that had already drifted, which this restore must not hide
-=======
-            // seq_rm above freed exactly the cells this sequence held. anything else in the way
-            // is a cache that had already drifted, which this restore must not paper over
->>>>>>> theirs
             for (uint32_t i = 0; i < cell_count; ++i) {
                 const uint32_t idx = sinfo.idxs[0][i];
 
@@ -3009,12 +2930,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-<<<<<<< ours
         // the cells go in from 0, so a mirrored cache lands on the same ones as long as it restores the same count. the layout itself carries no more information here
-=======
-        // the cells go in from 0, so a mirrored cache lands on the same ones as long as it
-        // restores the same count. the layout itself carries no more information here
->>>>>>> theirs
         if (sinfo_in && (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != cell_count)) {
             LLAMA_LOG_ERROR("%s: mirrored slot layout holds %d cells, this cache restores %d\n", __func__,
                     sinfo_in->empty() ? 0 : (int) sinfo_in->idxs[0].size(), cell_count);

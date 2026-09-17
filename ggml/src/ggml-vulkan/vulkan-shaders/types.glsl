@@ -1884,6 +1884,8 @@ struct block_rocmfpx_fp8
 
 #if defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST) || defined(DATA_A_ROCMFPX_FAMILY)
 #define DATA_A_ROCMFP_ANY
+#endif
+
 #define QUANT_K_TURBO3_0 128
 #define QUANT_R_TURBO3_0 1
 

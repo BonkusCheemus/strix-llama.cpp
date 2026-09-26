@@ -89,6 +89,8 @@
 #define cudaMemAdvise hipMemAdvise
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyToSymbol hipMemcpyToSymbol     // TurboQuant constants (LLM-739)
+#define cudaMemcpyFromSymbol hipMemcpyFromSymbol
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice

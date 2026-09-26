@@ -117,5 +117,10 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
         list(APPEND SRCS "${SRC}")
     endforeach()
 
+    # TurboQuant KV (LLM-739): turbo2/3/4 are runtime-only KV types outside FA_TYPES,
+    # so their vec instances are always compiled rather than selected by GGML_CUDA_FA_QUANTS.
+    file(GLOB TURBO_SRCS "${DIR}/template-instances/fattn-vec-instance-*turbo*.cu")
+    list(APPEND SRCS ${TURBO_SRCS})
+
     set(${OUT_SRCS} ${SRCS} PARENT_SCOPE)
 endfunction()

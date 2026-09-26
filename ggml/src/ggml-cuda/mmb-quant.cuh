@@ -305,7 +305,8 @@ static void mmb_dispatch_quant(ggml_type type, Fn fn) {
     }
 }
 
-__device__ __forceinline__ void mmb_dq_q4k_slice(uint4 q0, uint4 q1, uint4 meta, int slice, uint32_t * out) {
+template <bool HALF = false>
+__device__ __forceinline__ void mmb_dq_q4k_slice(uint4 q0, uint4 q1, uint4 meta, int slice, uint32_t * out, int half = 0) {
     const float d = mmb_h2f((uint16_t) meta.x), dm = mmb_h2f((uint16_t)(meta.x >> 16));
     auto byte = [&](int i) { const uint32_t word = i < 4 ? meta.y : i < 8 ? meta.z : meta.w; return (word >> (8 * (i & 3))) & 255; };
     auto scale_min = [&](int i, float & ds, float & ms) {
@@ -317,12 +318,13 @@ __device__ __forceinline__ void mmb_dq_q4k_slice(uint4 q0, uint4 q1, uint4 meta,
     scale_min(2 * slice, d0, m0); scale_min(2 * slice + 1, d1, m1);
     const uint32_t words[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
+    for (int j = 0; j < (HALF ? 4 : 8); ++j) {
+        const int wj = HALF ? j + 4 * half : j;
         const uint32_t q = words[j];
-        out[2*j] = mmb_pack2(d0 * (q & 15) - m0, d0 * ((q >> 8) & 15) - m0);
-        out[2*j + 1] = mmb_pack2(d0 * ((q >> 16) & 15) - m0, d0 * ((q >> 24) & 15) - m0);
-        out[16 + 2*j] = mmb_pack2(d1 * ((q >> 4) & 15) - m1, d1 * ((q >> 12) & 15) - m1);
-        out[16 + 2*j + 1] = mmb_pack2(d1 * ((q >> 20) & 15) - m1, d1 * (q >> 28) - m1);
+        out[2*wj] = mmb_pack2(d0 * (q & 15) - m0, d0 * ((q >> 8) & 15) - m0);
+        out[2*wj + 1] = mmb_pack2(d0 * ((q >> 16) & 15) - m0, d0 * ((q >> 24) & 15) - m0);
+        out[16 + 2*wj] = mmb_pack2(d1 * ((q >> 4) & 15) - m1, d1 * ((q >> 12) & 15) - m1);
+        out[16 + 2*wj + 1] = mmb_pack2(d1 * ((q >> 20) & 15) - m1, d1 * (q >> 28) - m1);
     }
 }
 

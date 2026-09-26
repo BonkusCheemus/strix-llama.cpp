@@ -6374,26 +6374,28 @@ struct test_swiglu_iq3_mmvq : public test_case {
 };
 
 // Qwen3.8-Flash-Next prefill MoE (512 experts, top-10) with a skewed routing that reproduces the measured
-// tokens-per-expert histogram of a 4096-token ubatch. glu: IQ3_S gate/up + swiglu; !glu: IQ4_NL down.
+// tokens-per-expert histogram of a 4096-token ubatch. The selected quant covers routed gate/up or down.
 struct test_moe_prefill : public test_case {
     const bool glu; const int64_t n;
+    const ggml_type quant;
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_PREFILL"; }
-    std::string vars() override { return VARS_TO_STR2(glu, n); }
+    std::string vars() override { return VARS_TO_STR3(glu, n, quant); }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 2560 * 640 * 10 * n * (glu ? 2 : 1); }
-    test_moe_prefill(bool glu, int64_t n) : glu(glu), n(n) {}
+    test_moe_prefill(bool glu, int64_t n, ggml_type type = GGML_TYPE_COUNT)
+        : glu(glu), n(n), quant(type == GGML_TYPE_COUNT ? (glu ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ4_NL) : type) {}
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 512, n);
         ggml_set_name(ids_all, "ids");
         ggml_tensor * ids = ggml_view_2d(ctx, ids_all, 10, n, ids_all->nb[1], 0);
         if (glu) {
-            ggml_tensor * gw = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ3_S, 2560, 640, 512);
-            ggml_tensor * uw = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ3_S, 2560, 640, 512);
+            ggml_tensor * gw = ggml_new_tensor_3d(ctx, quant, 2560, 640, 512);
+            ggml_tensor * uw = ggml_new_tensor_3d(ctx, quant, 2560, 640, 512);
             ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2560, 1, n);
             return ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gw, x, ids), ggml_mul_mat_id(ctx, uw, x, ids));
         }
-        ggml_tensor * dw = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ4_NL, 640, 2560, 512);
+        ggml_tensor * dw = ggml_new_tensor_3d(ctx, quant, 640, 2560, 512);
         ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 640, 10, n);
         return ggml_mul_mat_id(ctx, dw, x, ids);
     }
@@ -13055,6 +13057,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, false, 512, 129, 256, 2));
     test_cases.emplace_back(new test_moe_prefill(true, 512));
     test_cases.emplace_back(new test_moe_prefill(false, 512));
+    test_cases.emplace_back(new test_moe_prefill(true, 511, GGML_TYPE_Q4_K));
+    test_cases.emplace_back(new test_moe_prefill(true, 512, GGML_TYPE_Q4_K));
+    test_cases.emplace_back(new test_moe_prefill(true, 513, GGML_TYPE_Q4_K));
+    test_cases.emplace_back(new test_moe_prefill(false, 512, GGML_TYPE_Q5_1));
     test_cases.emplace_back(new test_mul_mat_pair());
 
     // gpt-oss issue with Vulkan mmq_id

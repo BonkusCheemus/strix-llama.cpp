@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "speculative-cost.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -184,6 +185,12 @@ struct common_speculative_impl {
     std::vector<int32_t> n_last_draft; // per-seq size of the draft just issued
     bool adaptive_n = false;           // enabled by --spec-draft-adaptive
 
+    // --spec-draft-cost: size the draft for tokens per second instead (speculative-cost.h).
+    // Fed by common_speculative_accept with this impl's own draft and verify times.
+    bool             cost_mode       = false;
+    common_spec_cost cost;
+    int64_t          t_last_draft_us = 0;  // wall time of this impl's most recent draft() call
+
     static constexpr float acc_ema_alpha  = 0.25f; // ~4-step memory
     static constexpr float acc_ema_probe  = 1.0f;  // additive growth on a clean draft
     static constexpr float acc_ema_init   = 2.0f;
@@ -223,6 +230,11 @@ struct common_speculative_impl {
         if (!adaptive_n || seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
             return n_cfg;
         }
+        if (cost_mode) {
+            const int32_t n = cost.choose(std::max(1, n_min), n_cfg);
+            n_last_draft[seq_id] = n;
+            return n;
+        }
         const int32_t n_want = (int32_t) std::lround(acc_ema[seq_id]);
         const int32_t n      = std::max(std::max(1, n_min), std::min(n_cfg, n_want));
         acc_ema[seq_id]      = std::min(acc_ema[seq_id], (float) n_cfg); // do not let the probe run away
@@ -234,6 +246,7 @@ struct common_speculative_impl {
         // start optimistic so a predictable prefix is not throttled from step one
         acc_ema.assign(n_seq, acc_ema_init);
         n_last_draft.assign(n_seq, 0);
+        cost.reset(n_max);
     }
 
     virtual ~common_speculative_impl() = default;
@@ -271,6 +284,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
         SPC_TRC("%s", "adding speculative implementation 'draft-simple'\n");
         adaptive_n = this->params.adaptive;
+        cost_mode  = this->params.adaptive_cost;
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f\n", this->params.n_max, this->params.n_min, this->params.p_min);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
@@ -537,6 +551,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     {
         SPC_TRC("%s", "adding speculative implementation 'draft-eagle3'\n");
         adaptive_n = this->params.adaptive;
+        cost_mode  = this->params.adaptive_cost;
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f, backend_sampling=%d\n", params.draft.n_max, params.draft.n_min, params.draft.p_min, (int) params.draft.backend_sampling);
 
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -1074,6 +1089,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         adaptive_n = this->params.adaptive;
+        cost_mode  = this->params.adaptive_cost;
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
@@ -1500,6 +1516,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         adaptive_n = this->params.adaptive;
+        cost_mode  = this->params.adaptive_cost;
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
@@ -2322,6 +2339,11 @@ struct common_speculative {
     // which implementaion was used for a given seq_id
     std::vector<common_speculative_impl *> impl_last;
 
+    // --spec-draft-cost: tokens actually drafted per seq, and when drafting ended;
+    // the gap from here to common_speculative_accept is the target's verify round
+    std::vector<int32_t> n_drafted;
+    int64_t              t_draft_end_us = 0;
+
     std::vector<double> synth_probs;
 };
 
@@ -2863,6 +2885,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .dparams     = */ common_speculative_draft_params_vec(n_seq),
         /* .impls       = */ std::move(impls),
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
+        /* .n_drafted   = */ std::vector<int32_t>(n_seq, 0),
+        /* .t_draft_end_us = */ 0,
         /* .synth_probs = */ {},
     });
 
@@ -2963,7 +2987,9 @@ void common_speculative_draft(common_speculative * spec) {
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+            const int64_t t0 = ggml_time_us();
             impl->draft(dparams);
+            impl->t_last_draft_us = ggml_time_us() - t0;
             impl->n_call_draft++;
         }
 
@@ -2996,6 +3022,9 @@ void common_speculative_draft(common_speculative * spec) {
 
                     // remember which implementation was used
                     spec->impl_last[seq_id] = impl.get();
+                    if ((size_t) seq_id < spec->n_drafted.size()) {
+                        spec->n_drafted[seq_id] = (int32_t) result.size();
+                    }
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
@@ -3011,6 +3040,8 @@ void common_speculative_draft(common_speculative * spec) {
             break;
         }
     }
+
+    spec->t_draft_end_us = ggml_time_us();
 
     // these sequences failed to generate a draft
     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
@@ -3047,6 +3078,12 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         }
 
         impl->update_acc_ema(seq_id, n_accepted);
+
+        if (impl->cost_mode && (size_t) seq_id < spec->n_drafted.size() && spec->n_drafted[seq_id] > 0) {
+            const double t_verify_s = (ggml_time_us() - spec->t_draft_end_us) * 1e-6;
+            impl->cost.observe(spec->n_drafted[seq_id], n_accepted, impl->t_last_draft_us * 1e-6, t_verify_s);
+            spec->n_drafted[seq_id] = 0;
+        }
         impl->accept(seq_id, n_accepted, false);
         impl->n_call_accept++;
     }

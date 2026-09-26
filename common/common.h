@@ -363,6 +363,9 @@ struct common_params_speculative_draft {
     // size each draft from measured acceptance instead of always drafting n_max
     bool adaptive = false;
 
+    // with adaptive: pick the draft length that maximizes measured tokens per second (LLM-740)
+    bool adaptive_cost = false;
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

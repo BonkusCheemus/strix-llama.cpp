@@ -6298,6 +6298,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TQ3_1S],  "dequant_tq3_1s",  dequant_tq3_1s_len,  dequant_tq3_1s_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TQ4_1S],  "dequant_tq4_1s",  dequant_tq4_1s_len,  dequant_tq4_1s_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TURBO3_0], "dequant_turbo3_0", dequant_turbo3_0_len, dequant_turbo3_0_data, "main", 2, 5 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
+    // FA dequant-once prefill scratch for TurboQuant K/V (LLM-669). Turbo stays native in
+    // ggml_vk_fa_kv_native, so decode keeps the fused FA dequant; the flash-attn gate takes
+    // this path only at prefill (>= 64 query rows), through its k_quant && v_quant arm.
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_TURBO2_0], "dequant_turbo2_0_transpose", dequant_turbo2_0_transpose_len, dequant_turbo2_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_TURBO3_0], "dequant_turbo3_0_transpose", dequant_turbo3_0_transpose_len, dequant_turbo3_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_TURBO4_0], "dequant_turbo4_0_transpose", dequant_turbo4_0_transpose_len, dequant_turbo4_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
 
     // get_rows
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F32 ], "get_rows_f32",  get_rows_f32_len,  get_rows_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
@@ -12302,8 +12308,9 @@ static bool ggml_vk_fa_kv_native(ggml_type t, bool coopmat2) {
     case GGML_TYPE_IQ4_NL: // native FA support since upstream 8161641
     // TurboQuant K/V (LLM-735 rebase of a23ce2a79): dequant is fused into the
     // scalar/coopmat1 FA shaders via dequantize4() (flash_attn_dequant.glsl),
-    // so they are native here. There is no dequant_transpose pipeline for them,
-    // so routing them to the dequant-once scratch would be refused, not faster.
+    // so they are native here (decode reads them fused). At prefill the gate
+    // still routes them to the dequant-once scratch as quantized K/V, through
+    // dequant_turbo*_transpose (LLM-669); GGML_VK_FA_DEQUANT=0 turns that off.
     case GGML_TYPE_TURBO2_0:
     case GGML_TYPE_TURBO3_0:
     case GGML_TYPE_TURBO4_0:

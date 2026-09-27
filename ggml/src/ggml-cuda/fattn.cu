@@ -666,6 +666,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    // LLM-744 experiment: turbo K/V has kernels only in VEC; TILE and MMA convert the whole K/V view
+    // to f16 on every call, a cost that grows with depth. Spec-verify batches (3-9 tokens) pay it
+    // every round. GGML_FA_TURBO_VEC_MAX_COLS=N keeps batches up to N on VEC. Unset = old routing.
+    // ponytail: env knob for the A/B sweep; replace with a measured per-arch rule if it wins.
+    {
+        const auto is_turbo = [](ggml_type t) {
+            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+        };
+        static const int turbo_vec_max_cols = [] {
+            const char * e = getenv("GGML_FA_TURBO_VEC_MAX_COLS");
+            return e ? atoi(e) : 0;
+        }();
+        if (can_use_vector_kernel && (is_turbo(K->type) || is_turbo(V->type)) && Q->ne[1] <= turbo_vec_max_cols) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+    }
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {

@@ -183,7 +183,7 @@ static __global__ void top_k_radix_reset_counters(top_k_radix_state * states, in
     }
 }
 
-template<int BLOCK_SIZE>
+template<int BLOCK_SIZE, bool STABLE_TIES = false>
 static __global__ void top_k_radix_gather(
         const float * __restrict__ src,
         int * __restrict__ dst,
@@ -205,14 +205,63 @@ static __global__ void top_k_radix_gather(
         if (key > state->prefix) {
             const int pos = atomicAdd(&state->greater_count, 1);
             row_dst[pos] = col;
-        } else if (key == state->prefix) {
-            const int pos = atomicAdd(&state->equal_count, 1);
-            if (pos < state->rank) {
-                row_dst[k - state->rank + pos] = col;
+        } else if constexpr (!STABLE_TIES) {
+            if (key == state->prefix) {
+                const int pos = atomicAdd(&state->equal_count, 1);
+                if (pos < state->rank) {
+                    row_dst[k - state->rank + pos] = col;
+                }
             }
         }
     }
 }
+
+#if defined(GGML_USE_HIP)
+// ties with the k-th score, taken in increasing column order: one block per row scans the row in order,
+// so the selected set does not depend on the scheduling of the atomic gather
+template<int BLOCK_SIZE>
+static __device__ void top_k_gather_equal(
+        const float * src, int * dst, int ncols, uint32_t threshold, int limit, int offset) {
+    const int tid = threadIdx.x;
+    const int lane = tid % warpSize;
+    const int warp = tid / warpSize;
+    const int nwarps = BLOCK_SIZE / warpSize;
+    __shared__ int warp_counts[32];
+    int count = 0;
+
+    for (int base = 0; base < ncols && count < limit; base += BLOCK_SIZE) {
+        const int col = base + tid;
+        const bool equal = col < ncols && top_k_float_to_ordered(src[col]) == threshold;
+        const unsigned long long mask = __ballot(equal);
+        if (lane == 0) {
+            warp_counts[warp] = __popcll(mask);
+        }
+        __syncthreads();
+        int before = count;
+        for (int w = 0; w < nwarps; ++w) {
+            if (w < warp) {
+                before += warp_counts[w];
+            }
+            count += warp_counts[w];
+        }
+        const unsigned long long lane_mask = (1ULL << lane) - 1;
+        const int pos = before + __popcll(mask & lane_mask);
+        if (equal && pos < limit) {
+            dst[offset + pos] = col;
+        }
+        __syncthreads();
+    }
+}
+
+template<int BLOCK_SIZE>
+static __global__ void top_k_radix_gather_equal(
+        const float * src, int * dst, const top_k_radix_state * states, int ncols, int k) {
+    const int row = blockIdx.x;
+    const top_k_radix_state state = states[row];
+    top_k_gather_equal<BLOCK_SIZE>(src + (size_t) row*ncols, dst + (size_t) row*k,
+                                  ncols, state.prefix, state.rank, k - state.rank);
+}
+#endif // defined(GGML_USE_HIP)
 
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool,
@@ -246,9 +295,18 @@ static void top_k_radix_cuda(
 
         top_k_radix_reset_counters
             <<<(iter_nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, iter_nrows);
+#if defined(GGML_USE_HIP)
+        // HIP: ties at the cut by increasing column index, QSA block scores often tie at exactly zero
+        top_k_radix_gather<BLOCK_SIZE, true>
+            <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+                src, dst, states, ncols, k, blocks_per_row);
+        top_k_radix_gather_equal<BLOCK_SIZE>
+            <<<iter_nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
+#else
         top_k_radix_gather<BLOCK_SIZE>
             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
                 src, dst, states, ncols, k, blocks_per_row);
+#endif // defined(GGML_USE_HIP)
 
         src += (size_t) ncols * iter_nrows;
         dst += (size_t) k     * iter_nrows;

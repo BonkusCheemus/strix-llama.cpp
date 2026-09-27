@@ -167,6 +167,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build_and_test(test-qsa-prefix.cpp)
+llama_build_and_test(test-qsa-fast.cpp)
 llama_build_and_test(test-ple-disk.cpp)
 llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL
 # llama_context state tests: KV and recurrent state save, load, copy, rollback

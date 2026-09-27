@@ -14898,6 +14898,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 16));
         }
     }
+    // qwen4exp QSA indexer scorer at 128k / 250k depth (fused GEMM + head sum + visibility on RDNA3.5)
+    for (int blocks : {31250, 62500}) {
+        test_cases.emplace_back(new test_indexer_score(blocks, 512, true));
+    }
     // qwen4exp QSA block selection at 128k / 250k depth: 512 queries, 512 blocks each
     for (int64_t cols : {31250, 62500}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 512, 1, 1}, 512));

@@ -709,22 +709,22 @@ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X, 
 // out of the Infinity Cache. Here each workgroup rounds its BM key rows to F16 into LDS once and walks all T columns,
 // staging each 128-column chunk of the queries (pre-rounded to F16 once per call) in LDS. Every output tile issues the
 // same WMMAs on the same F16 fragments in the same K order as the split kernel (TWO, !XSPLIT: hi parts only), and the
-// epilogue is identical, so the result matches it bit for bit.
+// epilogue computes the same values, so the result matches it bit for bit.
 __global__ void mmb_f32_to_f16_kernel(const float * __restrict__ x, uint16_t * __restrict__ y, const int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __builtin_bit_cast(uint16_t, (_Float16) x[i]);
 }
 
-template <int BM>
+template <int BM, int BN, int WAVES_M>
 __global__ void __launch_bounds__(MMB_NT, 1)
 mmb_idx_score_kernel(const float * __restrict__ W, const uint16_t * __restrict__ Xh, float * __restrict__ D,
         const int M, const int K, const int T, const int32_t * __restrict__ tails, const int32_t * __restrict__ starts) {
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     NO_DEVICE_CODE;
 #else
-    constexpr int KMAX = 128, LS = KMAX + 8, BN = 128;
-    constexpr int WAVES_M = 2, WTM = BM / WAVES_M, WTN = BN / 4, TM = WTM / 16, TN = WTN / 16;
-    static_assert(WAVES_M * 4 * 32 == MMB_NT && TM >= 1 && TN >= 1, "8 waves: 2 along M, 4 along T");
+    constexpr int KMAX = 128, LS = KMAX + 8;
+    constexpr int WAVES_N = MMB_NT / 32 / WAVES_M, WTM = BM / WAVES_M, WTN = BN / WAVES_N, TM = WTM / 16, TN = WTN / 16;
+    static_assert(WAVES_M * WAVES_N * 32 == MMB_NT && TM >= 1 && TN >= 1 && WTM % 16 == 0 && WTN % 16 == 0, "tile must use every wave");
     __shared__ __align__(16) uint16_t Ah[BM * LS];
     __shared__ __align__(16) uint16_t Bh[BN * LS];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, wm = wave % WAVES_M, wn = wave / WAVES_M;
@@ -813,9 +813,9 @@ mmb_idx_score_kernel(const float * __restrict__ W, const uint16_t * __restrict__
                     const int q = ((t0 + wn * WTN + j * 16) >> 2) + p;
                     if ((p >> 1) == cn && m < M && q < Q) {
                         if (tails) {
-                            const float d    = (float) tails[q] - sm[i];
-                            const float step = d > 0.0f;
-                            s = s + logf(step);
+                            // log(step(d)) is exactly 0 or -inf, and s >= +0, so this is s + logf(step)
+                            const float d = (float) tails[q] - sm[i];
+                            s = d > 0.0f ? s + 0.0f : -INFINITY;
                         }
                         D[(size_t) q * M + m] = s;
                     }
@@ -1103,7 +1103,8 @@ void ggml_cuda_mmb_idx_score(ggml_backend_cuda_context & ctx, const ggml_tensor 
         ggml_cuda_pool_alloc<uint16_t> xh(ctx.pool(), (size_t) T * K);
         const int64_t n = (int64_t) T * K;
         mmb_f32_to_f16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(X, xh.get(), n);
-        mmb_idx_score_kernel<64><<<(M + 63) / 64, MMB_NT, 0, stream>>>(W, xh.get(), D, M, K, T, tails, starts);
+        // 64 key rows x 64 query columns per step (2 x 4 waves): fastest of the shapes tried on gfx1151 at 250k depth
+        mmb_idx_score_kernel<64, 64, 2><<<(M + 63) / 64, MMB_NT, 0, stream>>>(W, xh.get(), D, M, K, T, tails, starts);
         CUDA_CHECK(cudaGetLastError());
         return;
     }

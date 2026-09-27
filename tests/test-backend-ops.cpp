@@ -4111,10 +4111,28 @@ struct test_indexer_head_sum : public test_case {
     const int blocks, heads, tokens, streams;
     const bool view, escape;
     const int alias;
-    test_indexer_head_sum(int blocks, int heads, int tokens, int streams=1, bool view=false, bool escape=false, int alias=0)
-        : blocks(blocks), heads(heads), tokens(tokens), streams(streams), view(view), escape(escape), alias(alias) {}
+    const int vis;   // 1: compact visibility chain after the sum, 2: same with the log output also escaping
+    ggml_tensor * limits = nullptr;
+    test_indexer_head_sum(int blocks, int heads, int tokens, int streams=1, bool view=false, bool escape=false, int alias=0, int vis=0)
+        : blocks(blocks), heads(heads), tokens(tokens), streams(streams), view(view), escape(escape), alias(alias), vis(vis) {}
     std::string op_desc(ggml_tensor *) override { return "INDEXER_HEAD_SUM"; }
-    std::string vars() override { return VARS_TO_STR7(blocks, heads, tokens, streams, view, escape, alias); }
+    std::string vars() override { return VARS_TO_STR8(blocks, heads, tokens, streams, view, escape, alias, vis); }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == limits) {
+                // block starts (some INT32_MAX: not a complete block), then tails, then row ids (0)
+                const int extra = 7;
+                std::vector<int32_t> v(ggml_nelements(t), 0);
+                std::uniform_int_distribution<int32_t> d(0, 4 * blocks);
+                for (int b = 0; b < blocks + extra; ++b) { v[b] = b % 97 == 5 ? INT32_MAX : 4 * b + (b % 3); }
+                for (int q = 0; q < tokens; ++q) { v[blocks + extra + q] = q % 13 == 0 ? 4 * (q * blocks / tokens) : d(rng); }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 0.0; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -4129,6 +4147,72 @@ struct test_indexer_head_sum : public test_case {
         }
         if (escape) sum=ggml_add(ctx, sum, first);
         if (alias) { sum->view_src=backing;sum->view_offs=alias==2 ? sizeof(float) : 0; }
+        if (vis) {
+            // as qwen4exp_apply_compact_visibility with n_seq == 1; the limits hold more blocks than the scorer sees
+            const int extra = 7;
+            limits = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, blocks + extra + 2 * tokens);
+            ggml_set_input(limits);
+            auto * starts = ggml_cast(ctx, ggml_view_1d(ctx, limits, blocks, 0), GGML_TYPE_F32);
+            auto * tails = ggml_cast(ctx, ggml_view_1d(ctx, limits, tokens, (blocks + extra) * sizeof(int32_t)), GGML_TYPE_F32);
+            tails = ggml_reshape_2d(ctx, tails, 1, tokens);
+            auto * lg = ggml_log(ctx, ggml_step(ctx, ggml_sub(ctx, ggml_repeat(ctx, tails, sum), starts)));
+            sum = ggml_add(ctx, sum, lg);
+            if (vis == 2) sum = ggml_add(ctx, sum, lg);
+        }
+        return sum;
+    }
+};
+
+// qwen4exp QSA indexer scorer: MUL_MAT(pooled keys F32 [128, blocks], q [128, 4*queries]) -> RESHAPE -> RELU -> head sum
+// (-> compact visibility). On RDNA3.5 the whole chain is one fused GEMM unless GGML_CUDA_DISABLE_IDX_GEMM is set.
+struct test_indexer_score : public test_case {
+    const int blocks, queries;
+    const bool vis, bounded;
+    ggml_tensor * limits = nullptr;
+    test_indexer_score(int blocks, int queries, bool vis, bool bounded = false)
+        : blocks(blocks), queries(queries), vis(vis), bounded(bounded) {}
+    std::string op_desc(ggml_tensor *) override { return "INDEXER_SCORE"; }
+    std::string vars() override { return VARS_TO_STR4(blocks, queries, vis, bounded); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-5; }   // WMMA rounds the operands to f16
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(4321);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == limits) {
+                const int extra = 5;
+                std::vector<int32_t> v(ggml_nelements(t), 0);
+                std::uniform_int_distribution<int32_t> d(0, 4 * blocks);
+                for (int b = 0; b < blocks + extra; ++b) { v[b] = b % 89 == 3 ? INT32_MAX : 4 * b; }
+                for (int q = 0; q < queries; ++q) { v[blocks + extra + q] = d(rng); }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int dim = 128, heads = 4;
+        auto * keys = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, bounded ? blocks + 32 : blocks);
+        auto * k = bounded ? ggml_view_2d(ctx, keys, dim, blocks, keys->nb[1], 0) : keys;
+        auto * qall = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, heads * (queries + (bounded ? 8 : 0)));
+        auto * q = bounded ? ggml_view_2d(ctx, qall, dim, heads * queries, qall->nb[1], 8 * heads * qall->nb[1]) : qall;
+        auto * score = ggml_mul_mat(ctx, k, q);
+        score = ggml_reshape_4d(ctx, score, blocks, heads, queries, 1);
+        score = ggml_relu(ctx, score);
+        ggml_tensor * sum = nullptr;
+        for (int h = 0; h < heads; ++h) {
+            auto * slice = ggml_view_3d(ctx, score, blocks, queries, 1, score->nb[2], score->nb[3], h * score->nb[1]);
+            sum = sum ? ggml_add(ctx, sum, slice) : ggml_cont(ctx, slice);
+        }
+        if (vis) {
+            const int extra = 5;
+            limits = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, blocks + extra + 2 * queries);
+            ggml_set_input(limits);
+            auto * starts = ggml_cast(ctx, ggml_view_1d(ctx, limits, blocks, 0), GGML_TYPE_F32);
+            auto * tails = ggml_cast(ctx, ggml_view_1d(ctx, limits, queries, (blocks + extra) * sizeof(int32_t)), GGML_TYPE_F32);
+            tails = ggml_reshape_2d(ctx, tails, 1, queries);
+            sum = ggml_add(ctx, sum, ggml_log(ctx, ggml_step(ctx, ggml_sub(ctx, ggml_repeat(ctx, tails, sum), starts))));
+        }
         return sum;
     }
 };
@@ -11506,6 +11590,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_indexer_head_sum(128,4,64,2,false,true));
     for (int alias : {1,2}) test_cases.emplace_back(new test_indexer_head_sum(128,4,64,2,false,false,alias));
     test_cases.emplace_back(new test_indexer_head_sum(10112,4,64));
+    for (int blocks : {65, 1000, 1025, 5000}) {
+        for (bool vis : {false, true}) test_cases.emplace_back(new test_indexer_score(blocks, 512, vis));
+    }
+    test_cases.emplace_back(new test_indexer_score(3001, 77, true));
+    test_cases.emplace_back(new test_indexer_score(3001, 512, true, true));
+    // with the compact visibility chain (fused on RDNA3.5 unless GGML_CUDA_DISABLE_IDX_VIS)
+    for (int blocks : {64, 1000, 10112}) test_cases.emplace_back(new test_indexer_head_sum(blocks,4,512,1,false,false,0,1));
+    test_cases.emplace_back(new test_indexer_head_sum(1000,4,77,1,false,false,0,1));
+    test_cases.emplace_back(new test_indexer_head_sum(1000,4,512,1,false,false,0,2));
+    test_cases.emplace_back(new test_indexer_head_sum(1000,4,64,2,false,false,0,1));
 
     for (int cols : {31, 32, 64, 128, 256, 288}) {
         for (int rows : {4095, 4096, 4097}) {
@@ -13505,6 +13599,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192,   nrows, 1, 1}, k, true));
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k, true));
         }
+    }
+
+    // qwen4exp QSA block selection: 512 queries, 512 of ~31k / ~62k blocks (one workgroup per row on RDNA3.5)
+    for (int64_t n : {31250, 62500, 65536}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 512, 1, 1}, 512));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 64, 1, 1}, 512, true));
     }
 
     for (int k : {1, 2, 3, 7, 15}) {

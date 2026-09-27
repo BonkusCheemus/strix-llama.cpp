@@ -4122,6 +4122,155 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
         if (overlap) { return 0; }
     }
     a.score = src; a.dst = (ggml_tensor *) prev; a.heads = (int) H;
+    a.vis_tails = nullptr; a.vis_starts = nullptr;
+    for (auto & l : a.vis_leafs) { l = nullptr; }
+    if (getenv("GGML_CUDA_DISABLE_IDX_VIS") != nullptr || ns != 1) return count;
+
+    auto vis_reject = [&]() {
+        for (auto & l : a.vis_leafs) { l = nullptr; }
+        return count;
+    };
+    // qwen4exp_apply_compact_visibility with one sequence, emitted right after the head sum:
+    //   starts = CPY(VIEW(limits) I32 [nb]) F32; tails = RESHAPE(CPY(VIEW(limits) I32 [nt]) F32, 1, nt)
+    //   ADD(sum, LOG(STEP(SUB(REPEAT(tails, sum), starts))))
+    // Every node between the head sum and the final ADD must belong to that chain, so skipping them is safe.
+    const int last = k - 1;
+    int fin = -1;
+    for (int j = last + 1; j < g->n_nodes && j <= last + 14; ++j) {
+        const ggml_tensor * n = g->nodes[j];
+        if (n->op == GGML_OP_ADD && n->src[0] == prev) { fin = j; break; }
+    }
+    if (fin < 0) return vis_reject();
+    const ggml_tensor * add = g->nodes[fin];
+    const ggml_tensor * lg  = add->src[1];
+    auto is_unary = [](const ggml_tensor * t, ggml_unary_op op) {
+        return t && t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == op && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+    };
+    if (add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || !ggml_are_same_shape(add, prev)) return vis_reject();
+    if (!lg || lg->op != GGML_OP_LOG || lg->type != GGML_TYPE_F32 || !ggml_is_contiguous(lg) || !ggml_are_same_shape(lg, prev)) return vis_reject();
+    const ggml_tensor * st = lg->src[0];
+    if (!is_unary(st, GGML_UNARY_OP_STEP) || !ggml_are_same_shape(st, prev)) return vis_reject();
+    const ggml_tensor * sb = st->src[0];
+    if (!sb || sb->op != GGML_OP_SUB || sb->type != GGML_TYPE_F32 || !ggml_is_contiguous(sb) || !ggml_are_same_shape(sb, prev)) return vis_reject();
+    const ggml_tensor * rp = sb->src[0];
+    const ggml_tensor * c1 = sb->src[1];
+    if (!rp || rp->op != GGML_OP_REPEAT || rp->type != GGML_TYPE_F32 || !ggml_is_contiguous(rp) || !ggml_are_same_shape(rp, prev)) return vis_reject();
+    auto is_i32_cast = [](const ggml_tensor * c, int64_t n) {
+        return c && c->op == GGML_OP_CPY && c->type == GGML_TYPE_F32 && ggml_is_contiguous(c) && ggml_nelements(c) == n &&
+               c->src[0] && c->src[0]->type == GGML_TYPE_I32 && ggml_is_contiguous(c->src[0]) &&
+               ggml_nelements(c->src[0]) == n;
+    };
+    // starts: [nb] broadcast over the queries
+    if (!is_i32_cast(c1, nb) || c1->ne[0] != nb) return vis_reject();
+    const ggml_tensor * tr = rp->src[0];
+    const ggml_tensor * c2 = tr;
+    if (tr && tr->op == GGML_OP_RESHAPE) { c2 = tr->src[0]; }
+    if (!tr || tr->ne[0] != 1 || tr->ne[1] != nt || ggml_nelements(tr) != nt || !is_i32_cast(c2, nt)) return vis_reject();
+
+    // the chain, and nothing else, sits between the head sum and the final ADD
+    const ggml_tensor * chain[10] = { c1->src[0], c1, c2->src[0], c2, tr, rp, sb, st, lg, add };
+    // The limits views and their I32->F32 casts read a graph input, which ggml_can_fuse_subgraph_ext rejects as an
+    // external view source (and the cast self-reference would skew its use count), so they are checked here: each
+    // must be read only by its successor in the chain. The fused kernel reads the limits input directly. The tails
+    // RESHAPE is a view of its cast and is checked the same way. When the scheduler copies the limits views to the
+    // device as split inputs, the casts read those copies (leafs) and the original VIEW nodes stay in the range
+    // unused; a view computes nothing, so skipping one is harmless whoever reads it.
+    const ggml_tensor * leafs[5] = { c1->src[0], c1, c2->src[0], c2, tr };
+    const ggml_tensor * users[5] = { c1, sb, c2, tr, rp };
+    int indices2[32]; ggml_op ops2[32];
+    int count2 = 0;
+    int n_manual = 0;
+    bool seen[5] = {};
+    for (int j = i; j <= fin; ++j) {
+        const ggml_tensor * n = g->nodes[j];
+        if (j > last) {
+            int leaf = -1;
+            for (int l = 0; l < 5; ++l) { if (leafs[l] == n) leaf = l; }
+            bool member = leaf >= 0;
+            for (const ggml_tensor * c : chain) { member = member || c == n; }
+            if (!member) {
+                if (n->op != GGML_OP_VIEW && n->op != GGML_OP_RESHAPE && n->op != GGML_OP_PERMUTE &&
+                    n->op != GGML_OP_TRANSPOSE && n->op != GGML_OP_NONE) return vis_reject();
+                if (n_manual >= 16) return vis_reject();
+                a.vis_leafs[n_manual++] = n;
+                continue;
+            }
+            if (leaf >= 0) {
+                if (n->flags & GGML_TENSOR_FLAG_OUTPUT) return vis_reject();
+                if (ggml_node_get_use_count(g, j) != 1 + (n->src[1] == n ? 1 : 0)) return vis_reject();
+                int refs = 0;
+                for (int s2 = 0; s2 < GGML_MAX_SRC; ++s2) { if (users[leaf]->src[s2] == n) ++refs; }
+                if (refs != 1) return vis_reject();
+                if (n_manual >= 16) return vis_reject();
+                a.vis_leafs[n_manual++] = n;
+                seen[leaf] = true;
+                continue;
+            }
+        }
+        if (count2 >= 32) return vis_reject();
+        indices2[count2] = j; ops2[count2] = n->op; ++count2;
+    }
+    // the casts and the tails RESHAPE must be nodes of the skipped range; the limits views may instead be leafs
+    // (device copies of split inputs), which are ready before the range starts
+    if (!seen[1] || !seen[3] || !seen[4] || tr == c2) return vis_reject();
+    for (int l : { 0, 2 }) {
+        if (!seen[l]) {
+            for (int j = i; j < g->n_nodes; ++j) { if (g->nodes[j] == leafs[l]) return vis_reject(); }
+        }
+    }
+    if (!ggml_can_fuse_subgraph_ext(g, indices2, count2, ops2, &fin, 1)) {
+        for (auto & l : a.vis_leafs) { l = nullptr; }
+        return vis_reject();
+    }
+    count2 = fin - i + 1;   // nodes skipped: every node from the RELU to the final ADD
+    // the fused kernel reads the scores and the limits while it writes the result
+    for (const ggml_tensor * in : { src, (const ggml_tensor *) c1->src[0], (const ggml_tensor *) c2->src[0] }) {
+        if (in->data && add->data) {
+            const uintptr_t av = (uintptr_t) in->data, bv = (uintptr_t) add->data;
+            const bool overlap = av <= bv ? bv - av < ggml_nbytes(in) : av - bv < ggml_nbytes(add);
+            if (overlap) { return vis_reject(); }
+        }
+    }
+    a.dst = (ggml_tensor *) add;
+    a.vis_starts = c1->src[0];
+    a.vis_tails  = c2->src[0];
+    return count2;
+}
+
+// MUL_MAT(keys F32, q) -> RESHAPE [M, 4, nq] -> RELU/head sum (+ visibility): the scorer writes the summed scores
+static int ggml_cuda_match_idx_gemm(ggml_backend_cuda_context & ctx, const ggml_cgraph * g, int i, ggml_cuda_idx_relu_sum_args & a) {
+    if (getenv("GGML_CUDA_DISABLE_IDX_GEMM") != nullptr || i + 3 >= g->n_nodes) return 0;
+    const ggml_tensor * mm = g->nodes[i];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[2] != nullptr || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm)) return 0;
+    const ggml_tensor * rs = g->nodes[i + 1];
+    if (rs->op != GGML_OP_RESHAPE || rs->src[0] != mm || rs->ne[0] != mm->ne[0] || rs->ne[1] != 4 || rs->ne[3] != 1 ||
+        rs->ne[1] * rs->ne[2] != mm->ne[1] * mm->ne[2] * mm->ne[3]) return 0;
+    const ggml_tensor * relu = g->nodes[i + 2];
+    if (relu->op != GGML_OP_UNARY || ggml_get_unary_op(relu) != GGML_UNARY_OP_RELU || relu->src[0] != rs) return 0;
+    const int c = ggml_cuda_match_idx_relu_sum(g, i + 2, a);
+    if (c <= 0 || a.score != rs || a.heads != 4) return 0;
+    if (!ggml_cuda_mmb_idx_score_supported(ctx, mm->src[0], mm->src[1], mm, a.heads)) return 0;
+    const int count = c + 2;
+    const int output = i + count - 1;
+    if (g->nodes[output] != a.dst) return 0;
+    int indices[32]; ggml_op ops[32];
+    int n = 0;
+    for (int j = i; j <= output; ++j) {
+        const ggml_tensor * node = g->nodes[j];
+        bool checked = false;
+        for (const ggml_tensor * l : a.vis_leafs) { checked = checked || (l && l == node); }
+        if (checked) continue;
+        if (n >= 32) return 0;
+        indices[n] = j; ops[n] = node->op; ++n;
+    }
+    if (!ggml_can_fuse_subgraph_ext(g, indices, n, ops, &output, 1)) return 0;
+    for (const ggml_tensor * in : { (const ggml_tensor *) mm->src[0], (const ggml_tensor *) mm->src[1], a.vis_tails, a.vis_starts }) {
+        if (in && in->data && a.dst->data) {
+            const uintptr_t av = (uintptr_t) in->data, bv = (uintptr_t) a.dst->data;
+            const bool overlap = av <= bv ? bv - av < ggml_nbytes(in) : av - bv < ggml_nbytes(a.dst);
+            if (overlap) { return 0; }
+        }
+    }
     return count;
 }
 
@@ -4613,6 +4762,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const int count = it->second;
             s_precomputed.erase(it);
             return count > 0 ? count : GGML_CUDA_FUSED_SELF;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        ggml_cuda_idx_relu_sum_args args;
+        const int count = ggml_cuda_match_idx_gemm(*cuda_ctx, cgraph, i, args);
+        if (count > 0) {
+            ggml_cuda_mmb_idx_score(*cuda_ctx, node->src[0], node->src[1], args.dst,
+                args.vis_tails  ? (const int32_t *) args.vis_tails->data  : nullptr,
+                args.vis_starts ? (const int32_t *) args.vis_starts->data : nullptr);
+            return count - 1;
         }
     }
 
@@ -7099,11 +7259,26 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
         if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
             for (int i = 0; i < cgraph->n_nodes; ++i) {
+                if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT) continue;
+                ggml_cuda_idx_relu_sum_args args;
+                if (ggml_cuda_match_idx_gemm(*cuda_ctx, cgraph, i, args) > 0) {
+                    const ggml_tensor * mm = cgraph->nodes[i];
+                    for (const ggml_tensor * in : { (const ggml_tensor *) mm->src[0], (const ggml_tensor *) mm->src[1], args.vis_tails, args.vis_starts }) {
+                        if (!in) { continue; }
+                        auto * root = const_cast<ggml_tensor *>(in->view_src ? in->view_src : in);
+                        params->add_alloc_dep(params->user_data, root, args.dst);
+                    }
+                }
+            }
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
                 if (cgraph->nodes[i]->op != GGML_OP_UNARY) continue;
                 ggml_cuda_idx_relu_sum_args args;
                 if (ggml_cuda_match_idx_relu_sum(cgraph, i, args) > 0) {
-                    auto * root = const_cast<ggml_tensor *>(args.score->view_src ? args.score->view_src : args.score);
-                    params->add_alloc_dep(params->user_data, root, args.dst);
+                    for (const ggml_tensor * in : { args.score, args.vis_tails, args.vis_starts }) {
+                        if (!in) { continue; }
+                        auto * root = const_cast<ggml_tensor *>(in->view_src ? in->view_src : in);
+                        params->add_alloc_dep(params->user_data, root, args.dst);
+                    }
                 }
             }
         }

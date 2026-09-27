@@ -572,10 +572,14 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
 __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo) {
     hi = __builtin_bit_cast(uint16_t, (_Float16) x); lo = __builtin_bit_cast(uint16_t, (_Float16) (x - (float) __builtin_bit_cast(_Float16, hi)));
 }
-template <int BM, int BN, int WTM, int WTN, bool TWO, bool XSPLIT>
+// EPI == 1 (qwen4exp QSA indexer scorer): the T columns are (query, head) pairs with 4 heads, and D is [M, T/4] with
+// D[q*M + m] = ((relu(h0) + relu(h1)) + relu(h2)) + relu(h3) (+ log(step(float(tails[q]) - float(starts[m]))) when
+// tails != nullptr): the exact expression the separate GEMM, idx_relu_sum and visibility chain evaluate.
+template <int BM, int BN, int WTM, int WTN, bool TWO, bool XSPLIT, int EPI = 0>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X, float * __restrict__ D, const int M, const int K, const int T,
-        const float * __restrict__ W2 = nullptr, float * __restrict__ D2 = nullptr, const int M1 = 0) {
+        const float * __restrict__ W2 = nullptr, float * __restrict__ D2 = nullptr, const int M1 = 0,
+        const int32_t * __restrict__ tails = nullptr, const int32_t * __restrict__ starts = nullptr) {
     // W2 != nullptr: two GEMMs on the same X, rows [0, M1) from W -> D (ld M1) and rows [M1, M) from W2 -> D2 (ld M - M1)
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     // WMMA (wave32, 16x16x16 bf16/f16 into f32) exists only on RDNA3; the host gate keeps other devices off this path
@@ -652,6 +656,42 @@ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X, 
         __syncthreads();
     }
     const int cm = lane & 15, cn = lane >> 4;
+    if constexpr (EPI == 1) {
+        // lane holds t = base + 4p + cn (e = 2p) and base + 4p + 2 + cn (e = 2p + 1): heads cn and 2 + cn of query
+        // base/4 + p; lane ^ 16 holds the other two heads of the same (m, query). The shuffles run on every lane.
+        const int Q = T >> 2;
+#pragma unroll
+        for (int i = 0; i < TM; ++i) { const int m = m0 + wm * WTM + i * 16 + cm;
+            const float sm = (tails && m < M) ? (float) starts[m] : 0.0f;
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                float o[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) o[e] = __shfl_xor(acc[i][j][e], 16, 32);
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    const float h0 = cn == 0 ? acc[i][j][2 * p]     : o[2 * p];
+                    const float h1 = cn == 0 ? o[2 * p]             : acc[i][j][2 * p];
+                    const float h2 = cn == 0 ? acc[i][j][2 * p + 1] : o[2 * p + 1];
+                    const float h3 = cn == 0 ? o[2 * p + 1]         : acc[i][j][2 * p + 1];
+                    float s = fmaxf(h0, 0.0f);
+                    s = s + fmaxf(h1, 0.0f);
+                    s = s + fmaxf(h2, 0.0f);
+                    s = s + fmaxf(h3, 0.0f);
+                    const int q = ((t0 + wn * WTN + j * 16) >> 2) + p;
+                    if ((p >> 1) == cn && m < M && q < Q) {
+                        if (tails) {
+                            const float d    = (float) tails[q] - sm;
+                            const float step = d > 0.0f;
+                            s = s + logf(step);
+                        }
+                        D[(size_t) q * M + m] = s;
+                    }
+                }
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int i = 0; i < TM; ++i) { const int m = m0 + wm * WTM + i * 16 + cm; if (m >= M) continue;
 #pragma unroll
@@ -911,6 +951,37 @@ bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_te
     if (ids->nb[0] != sizeof(int32_t) || ids->ne[2] != 1 || ids->ne[3] != 1) return false;
     if (T < mmb_min_t() || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
     return true;
+}
+
+// geometry ggml_cuda_mul_mat_mmb picks for an F32 weight with M > 64; the fused scorer only takes 0 and 5
+static int mmb_f32_tile_for(int M) {
+    static const int FT_env = getenv("MMB_F32_TILE") ? atoi(getenv("MMB_F32_TILE")) : -1;
+    return FT_env >= 0 ? FT_env : (M <= 1024 ? 5 : 0);
+}
+
+bool ggml_cuda_mmb_idx_score_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * mm, int heads) {
+    if (heads != 4 || src0->type != GGML_TYPE_F32 || !ggml_cuda_mmb_supported_mm(ctx, src0, src1, mm)) return false;
+    const int64_t M = src0->ne[1], T = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    if (M <= 64 || T % 4 != 0 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
+    const int FT = mmb_f32_tile_for((int) M);
+    return FT == 0 || FT == 5;
+}
+
+void ggml_cuda_mmb_idx_score(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const int32_t * tails, const int32_t * starts) {
+    cudaStream_t stream = ctx.stream();
+    const int K = (int) src0->ne[0], M = (int) src0->ne[1];
+    const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
+    const float * W = (const float *) src0->data, * X = (const float *) src1->data; float * D = (float *) dst->data;
+    if (mmb_f32_tile_for(M) == 5) {
+        dim3 g((M + 31) / 32, (T + 63) / 64);
+        mmb_f32split_kernel<32, 64, 16, 16, true, false, 1><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T, nullptr, nullptr, 0, tails, starts);
+    } else {
+        dim3 g((M + 127) / 128, (T + 127) / 128);
+        mmb_f32split_kernel<128, 128, 32, 64, true, false, 1><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T, nullptr, nullptr, 0, tails, starts);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

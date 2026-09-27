@@ -349,7 +349,7 @@ static void top_k_argsort_cuda(
 // falls back to further histogram passes over the row. The selected set is the same as top_k_radix_cuda with
 // stable_ties: every key above the k-th largest, then the lowest-column keys equal to it. Like that path, the order
 // of the keys above the threshold is unspecified; the equal keys follow them in column order.
-#define TOPK_WG_THREADS 512
+#define TOPK_WG_THREADS 1024
 #define TOPK_WG_CAP     4096
 
 // bin b of hist (NBINS bins, descending search) with sum(hist[> b]) < rank <= sum(hist[>= b]); returns b and the
@@ -403,9 +403,19 @@ static __global__ void __launch_bounds__(TOPK_WG_THREADS) top_k_wg_kernel(
     if (tid == 0) { n_out = 0; n_cand = 0; }
     __syncthreads();
 
-    // pass 1: top 12 bits
-    for (int c = tid; c < ncols; c += TOPK_WG_THREADS) {
-        atomicAdd(&hist[top_k_float_to_ordered(x[c]) >> 20], 1);
+    // pass 1: top 12 bits (four independent loads in flight per thread)
+    {
+        int c = tid;
+        for (; c + 3 * TOPK_WG_THREADS < ncols; c += 4 * TOPK_WG_THREADS) {
+            const float v0 = x[c], v1 = x[c + TOPK_WG_THREADS], v2 = x[c + 2 * TOPK_WG_THREADS], v3 = x[c + 3 * TOPK_WG_THREADS];
+            atomicAdd(&hist[top_k_float_to_ordered(v0) >> 20], 1);
+            atomicAdd(&hist[top_k_float_to_ordered(v1) >> 20], 1);
+            atomicAdd(&hist[top_k_float_to_ordered(v2) >> 20], 1);
+            atomicAdd(&hist[top_k_float_to_ordered(v3) >> 20], 1);
+        }
+        for (; c < ncols; c += TOPK_WG_THREADS) {
+            atomicAdd(&hist[top_k_float_to_ordered(x[c]) >> 20], 1);
+        }
     }
     __syncthreads();
     int b12, rank;
@@ -416,8 +426,8 @@ static __global__ void __launch_bounds__(TOPK_WG_THREADS) top_k_wg_kernel(
 
     // pass 2: keys above the bucket go out, the bucket is compacted when it fits
     const bool fits = bucket <= TOPK_WG_CAP;
-    for (int c = tid; c < ncols; c += TOPK_WG_THREADS) {
-        const uint32_t key = top_k_float_to_ordered(x[c]);
+    auto place = [&](const int c, const float v) {
+        const uint32_t key = top_k_float_to_ordered(v);
         const uint32_t top = key >> 20;
         if (top > (uint32_t) b12) {
             out[atomicAdd(&n_out, 1)] = c;
@@ -425,6 +435,14 @@ static __global__ void __launch_bounds__(TOPK_WG_THREADS) top_k_wg_kernel(
             const int p = atomicAdd(&n_cand, 1);
             ckey[p] = key; ccol[p] = c;
         }
+    };
+    {
+        int c = tid;
+        for (; c + 3 * TOPK_WG_THREADS < ncols; c += 4 * TOPK_WG_THREADS) {
+            const float v0 = x[c], v1 = x[c + TOPK_WG_THREADS], v2 = x[c + 2 * TOPK_WG_THREADS], v3 = x[c + 3 * TOPK_WG_THREADS];
+            place(c, v0); place(c + TOPK_WG_THREADS, v1); place(c + 2 * TOPK_WG_THREADS, v2); place(c + 3 * TOPK_WG_THREADS, v3);
+        }
+        for (; c < ncols; c += TOPK_WG_THREADS) place(c, x[c]);
     }
     __syncthreads();
 

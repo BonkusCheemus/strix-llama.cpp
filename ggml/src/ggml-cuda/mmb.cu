@@ -703,6 +703,129 @@ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X, 
 #endif
 }
 
+
+// qwen4exp QSA indexer scorer with the keys stationary. mmb_f32split_kernel<..., EPI=1> re-reads its key tile for every
+// 128-column tile of the 2048 (query, head) columns, which spills the ~32 MB of pooled F32 keys per layer (250k depth)
+// out of the Infinity Cache. Here each workgroup rounds its BM key rows to F16 into LDS once and walks all T columns,
+// staging each 128-column chunk of the queries (pre-rounded to F16 once per call) in LDS. Every output tile issues the
+// same WMMAs on the same F16 fragments in the same K order as the split kernel (TWO, !XSPLIT: hi parts only), and the
+// epilogue is identical, so the result matches it bit for bit.
+__global__ void mmb_f32_to_f16_kernel(const float * __restrict__ x, uint16_t * __restrict__ y, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __builtin_bit_cast(uint16_t, (_Float16) x[i]);
+}
+
+template <int BM>
+__global__ void __launch_bounds__(MMB_NT, 1)
+mmb_idx_score_kernel(const float * __restrict__ W, const uint16_t * __restrict__ Xh, float * __restrict__ D,
+        const int M, const int K, const int T, const int32_t * __restrict__ tails, const int32_t * __restrict__ starts) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
+    NO_DEVICE_CODE;
+#else
+    constexpr int KMAX = 128, LS = KMAX + 8, BN = 128;
+    constexpr int WAVES_M = 2, WTM = BM / WAVES_M, WTN = BN / 4, TM = WTM / 16, TN = WTN / 16;
+    static_assert(WAVES_M * 4 * 32 == MMB_NT && TM >= 1 && TN >= 1, "8 waves: 2 along M, 4 along T");
+    __shared__ __align__(16) uint16_t Ah[BM * LS];
+    __shared__ __align__(16) uint16_t Bh[BN * LS];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, wm = wave % WAVES_M, wn = wave / WAVES_M;
+    const int m0 = blockIdx.x * BM;
+    const int K4 = K / 4, K8 = K / 8;
+
+    // keys -> F16 (the hi part of mmb_split2), rows past M are zero
+    for (int idx = tid; idx < BM * K4; idx += MMB_NT) {
+        const int row = idx / K4, c4 = (idx % K4) * 4;
+        const float4 v = m0 + row < M ? *(const float4 *)(W + (size_t) (m0 + row) * K + c4) : make_float4(0.f, 0.f, 0.f, 0.f);
+        const uint32_t h0 = __builtin_bit_cast(uint16_t, (_Float16) v.x), h1 = __builtin_bit_cast(uint16_t, (_Float16) v.y);
+        const uint32_t h2 = __builtin_bit_cast(uint16_t, (_Float16) v.z), h3 = __builtin_bit_cast(uint16_t, (_Float16) v.w);
+        *(uint2 *)(Ah + row * LS + c4) = make_uint2(h0 | (h1 << 16), h2 | (h3 << 16));
+    }
+
+    // query chunks: BN rows x K halfs, 8 halfs per load; columns past T are zero
+    constexpr int B_IT = BN * KMAX / 8 / MMB_NT;
+    uint4 rb[B_IT];
+    const int b_loads = BN * K8;
+    auto gload = [&](const int t0) {
+#pragma unroll
+        for (int it = 0; it < B_IT; ++it) {
+            const int idx = tid + it * MMB_NT;
+            const int row = idx / K8, c8 = (idx % K8) * 8;
+            rb[it] = (idx < b_loads && t0 + row < T) ? *(const uint4 *)(Xh + (size_t) (t0 + row) * K + c8) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    auto lstore = [&]() {
+#pragma unroll
+        for (int it = 0; it < B_IT; ++it) {
+            const int idx = tid + it * MMB_NT;
+            if (idx < b_loads) { const int row = idx / K8, c8 = (idx % K8) * 8; *(uint4 *)(Bh + row * LS + c8) = rb[it]; }
+        }
+    };
+
+    const int r = lane & 15, cm = lane & 15, cn = lane >> 4;
+    const int Q = T >> 2;
+    float sm[TM];
+#pragma unroll
+    for (int i = 0; i < TM; ++i) { const int m = m0 + wm * WTM + i * 16 + cm; sm[i] = (tails && m < M) ? (float) starts[m] : 0.0f; }
+
+    gload(0);
+    for (int t0 = 0; t0 < T; t0 += BN) {
+        __syncthreads();   // the previous chunk is consumed (and the keys are stored on the first pass)
+        lstore();
+        __syncthreads();
+        if (t0 + BN < T) gload(t0 + BN);
+        v8f acc[TM][TN];
+#pragma unroll
+        for (int i = 0; i < TM; ++i)
+#pragma unroll
+            for (int j = 0; j < TN; ++j)
+#pragma unroll
+                for (int e = 0; e < 8; ++e) acc[i][j][e] = 0.f;
+        for (int k0 = 0; k0 < K; k0 += 16) {
+            v16s ah[TM], bh[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) { const int off = (wm * WTM + i * 16 + r) * LS + k0;
+                ah[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ah + off), *(const uint4 *)(Ah + off + 8)}); }
+#pragma unroll
+            for (int j = 0; j < TN; ++j) { const int off = (wn * WTN + j * 16 + r) * LS + k0;
+                bh[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Bh + off), *(const uint4 *)(Bh + off + 8)}); }
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], ah[i], acc[i][j]);
+        }
+        // epilogue of mmb_f32split_kernel<..., EPI=1>
+#pragma unroll
+        for (int i = 0; i < TM; ++i) { const int m = m0 + wm * WTM + i * 16 + cm;
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                float o[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) o[e] = __shfl_xor(acc[i][j][e], 16, 32);
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    const float h0 = cn == 0 ? acc[i][j][2 * p]     : o[2 * p];
+                    const float h1 = cn == 0 ? o[2 * p]             : acc[i][j][2 * p];
+                    const float h2 = cn == 0 ? acc[i][j][2 * p + 1] : o[2 * p + 1];
+                    const float h3 = cn == 0 ? o[2 * p + 1]         : acc[i][j][2 * p + 1];
+                    float s = fmaxf(h0, 0.0f);
+                    s = s + fmaxf(h1, 0.0f);
+                    s = s + fmaxf(h2, 0.0f);
+                    s = s + fmaxf(h3, 0.0f);
+                    const int q = ((t0 + wn * WTN + j * 16) >> 2) + p;
+                    if ((p >> 1) == cn && m < M && q < Q) {
+                        if (tails) {
+                            const float d    = (float) tails[q] - sm[i];
+                            const float step = d > 0.0f;
+                            s = s + logf(step);
+                        }
+                        D[(size_t) q * M + m] = s;
+                    }
+                }
+            }
+        }
+    }
+#endif
+}
+
 // two tile classes: experts with >= thresh rows get BN_BIG-row tiles, the rest BN_SMALL-row tiles (fewer wasted rows on tiny experts)
 __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t * __restrict__ desc_big, uint32_t * __restrict__ desc_small,
         const int E, const int nbig_max, const int nsmall_max, const int BN_BIG, const int BN_SMALL, const int thresh) {
@@ -974,6 +1097,16 @@ void ggml_cuda_mmb_idx_score(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int K = (int) src0->ne[0], M = (int) src0->ne[1];
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
     const float * W = (const float *) src0->data, * X = (const float *) src1->data; float * D = (float *) dst->data;
+    // keys-stationary scorer for the wide case (MMB_IDX_SCORE_V2=0 keeps the split kernel; same result)
+    static const bool v2 = getenv("MMB_IDX_SCORE_V2") == nullptr || atoi(getenv("MMB_IDX_SCORE_V2")) != 0;
+    if (v2 && mmb_f32_tile_for(M) == 0 && K <= 128 && K % 16 == 0) {
+        ggml_cuda_pool_alloc<uint16_t> xh(ctx.pool(), (size_t) T * K);
+        const int64_t n = (int64_t) T * K;
+        mmb_f32_to_f16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(X, xh.get(), n);
+        mmb_idx_score_kernel<64><<<(M + 63) / 64, MMB_NT, 0, stream>>>(W, xh.get(), D, M, K, T, tails, starts);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (mmb_f32_tile_for(M) == 5) {
         dim3 g((M + 31) / 32, (T + 63) / 64);
         mmb_f32split_kernel<32, 64, 16, 16, true, false, 1><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T, nullptr, nullptr, 0, tails, starts);

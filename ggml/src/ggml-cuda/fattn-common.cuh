@@ -1604,6 +1604,18 @@ void launch_fattn(
             }
         }
 
+        // LLM-743 experiment: single-token decode at long context on gfx1151 runs FA at ~15% of
+        // bandwidth; one wave of blocks leaves too few KV reads in flight. GGML_FA_DECODE_SPLIT_MULT
+        // multiplies the split for the decode case only. Unset = upstream behaviour.
+        // ponytail: env knob for the A/B sweep; replace with a measured per-arch rule if it wins.
+        if (Q->ne[1] == 1) {
+            static const int split_mult = [] {
+                const char * e = getenv("GGML_FA_DECODE_SPLIT_MULT");
+                return e ? std::max(1, atoi(e)) : 1;
+            }();
+            parallel_blocks = std::min(parallel_blocks*split_mult, ntiles_KV);
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];

@@ -2,6 +2,17 @@
 
 #include "common.cuh"
 
+// Scale multiply for the k-quant and i-quant mmvq dot products. The operands are small (|dp4a sums| < 2^19,
+// scales/mins <= 6 bits), so the 24-bit multiply is exact. On AMD it is full rate, where the 32-bit
+// v_mul_lo_u32 the compiler otherwise emits is quarter rate; NVIDIA keeps the plain multiply.
+static __device__ __forceinline__ int ggml_cuda_mul_small(const int a, const int b) {
+#if defined(GGML_USE_HIP)
+    return __mul24(a, b);
+#else
+    return a * b;
+#endif
+}
+
 #include <cstdint>
 
 static __device__ __forceinline__ int get_int_b1(const void * x, const int & i32) {
@@ -134,12 +145,12 @@ static __device__ __forceinline__ int apply_signs4(const int g, const uint32_t s
     // without it. It folds away wherever the caller passes a value the compiler already
     // sees is <= 15.
     const uint32_t nib     = sign_nib & 0x0fu;       // the 4 sign bits, one per byte
-    // 0x00204081 has bits at 0, 7, 14, 21 - one per sign. The multiply adds a copy shifted
+    // 0x00204081 has bits at 0, 7, 14, 21 one per sign. The multiply adds a copy shifted
     // by i for each set bit i, so bit i lands at 7i + i = 8i, the low bit of byte i. The four
     // copies occupy the disjoint ranges {0..3}, {7..10}, {14..17}, {21..24}, so nothing carries.
     const uint32_t spread  = nib * 0x00204081u;      // bit i -> bit 8i, plus 3 unwanted bits per copy
     const uint32_t ones    = spread & 0x01010101u;   // keep bit 8i only: 0x01 per negated byte
-    const uint32_t mask    = (ones << 8) - ones;     // ones * 255: 0xff per negated byte
+    const uint32_t mask    = (ones << 8) ones;     // ones * 255: 0xff per negated byte
     const uint32_t flipped = ((uint32_t) g) ^ mask;  // ones' complement of the negated bytes
     // + 1 completes the two's complement, and must not carry out of its byte -- which it would
     // for a grid byte of 0x00. Add only into the low 7 bits, where 0x7f + 1 == 0x80 still fits,
@@ -465,7 +476,7 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
 
         const int vi = (v >> (2*i)) & 0x03030303;
 
-        sumf_d += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * (sc & 0xF)); // SIMD dot product
+        sumf_d += d8[i] * ggml_cuda_mul_small(ggml_cuda_dp4a(vi, u[i], 0), sc & 0xF); // SIMD dot product
 
         // fill int with 4x m
         int m = sc >> 4;
@@ -561,7 +572,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
         const int vi = __vsubss4(vil, vih);
 
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf += d8[i] * ggml_cuda_mul_small(ggml_cuda_dp4a(vi, u[i], 0), sc); // SIMD dot product
     }
 
     return d3 * sumf;
@@ -608,8 +619,8 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
         const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0)); // sum of u
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);  // multiply constant part of q4_K with sum of q8_1 values
+        sumf_d += d8[i] * ggml_cuda_mul_small(dot1, sc[i]);
+        sumf_m += d8[i] * ggml_cuda_mul_small(dot2, m[i]);  // multiply constant part of q4_K with sum of q8_1 values
     }
 
     const float2 dm4f = __half22float2(dm4);
@@ -670,8 +681,8 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
         const int dot1 = ggml_cuda_dp4a(v0i, u[2*i+0], ggml_cuda_dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+0], ggml_cuda_dp4a(0x01010101, u[2*i+1], 0)); // sum of u
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += d8[i] * ggml_cuda_mul_small(dot1, sc[i]);
+        sumf_m += d8[i] * ggml_cuda_mul_small(dot2, m[i]);
 
     }
 
@@ -728,7 +739,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
 
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf += d8[i] * ggml_cuda_mul_small(ggml_cuda_dp4a(vi, u[i], 0), sc); // SIMD dot product
     }
 
     return d*sumf;
@@ -1515,7 +1526,7 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     }
 
     const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
-    sumi *= ls - 32;
+    sumi = ggml_cuda_mul_small(sumi, ls - 32);
 
     const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
     return d * sumi;

@@ -13924,6 +13924,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // LLM-753: Qwen3.8-27B full-attention prefill shape (24 Q heads, 4 KV heads, D=256), 512-token ubatch at depth
+    for (int64_t kv : {4096, 45056}) {
+        for (auto kv_types : std::vector<std::array<ggml_type, 2>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0.0f, 0.0f, GGML_PREC_F32, kv_types[0], kv_types[1]));
+        }
+    }
     return test_cases;
 }
 

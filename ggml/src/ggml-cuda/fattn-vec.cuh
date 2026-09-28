@@ -801,7 +801,13 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    if (Q->ne[1] == 1) {
+    static const bool turbo_cols1 = [] {
+        const char * e = getenv("GGML_FA_TURBO_VEC_COLS1");
+        return e && atoi(e) != 0;
+    }();
+    constexpr bool K_has_lut = type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0;
+
+    if (Q->ne[1] == 1 || (K_has_lut && D <= 256 && turbo_cols1)) {
         constexpr int cols_per_block = 1;
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;

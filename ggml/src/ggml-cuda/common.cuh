@@ -21,6 +21,7 @@
 #endif
 #endif
 #include "ggml-common.h"
+#include "../../rocmfp4/rocmfp4.h"
 
 #include <array>
 #include <algorithm>
@@ -1068,6 +1069,22 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q8_0> {
     static constexpr int qr = QR8_0;
     static constexpr int qi = QI8_0;
     static constexpr int bs = sizeof(block_q8_0);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+    static constexpr int bs = sizeof(block_rocmfp4);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4_FAST> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+    static constexpr int bs = sizeof(block_rocmfp4_fast);
 };
 
 template<>

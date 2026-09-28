@@ -145,12 +145,12 @@ static __device__ __forceinline__ int apply_signs4(const int g, const uint32_t s
     // without it. It folds away wherever the caller passes a value the compiler already
     // sees is <= 15.
     const uint32_t nib     = sign_nib & 0x0fu;       // the 4 sign bits, one per byte
-    // 0x00204081 has bits at 0, 7, 14, 21 one per sign. The multiply adds a copy shifted
+    // 0x00204081 has bits at 0, 7, 14, 21 - one per sign. The multiply adds a copy shifted
     // by i for each set bit i, so bit i lands at 7i + i = 8i, the low bit of byte i. The four
     // copies occupy the disjoint ranges {0..3}, {7..10}, {14..17}, {21..24}, so nothing carries.
     const uint32_t spread  = nib * 0x00204081u;      // bit i -> bit 8i, plus 3 unwanted bits per copy
     const uint32_t ones    = spread & 0x01010101u;   // keep bit 8i only: 0x01 per negated byte
-    const uint32_t mask    = (ones << 8) ones;     // ones * 255: 0xff per negated byte
+    const uint32_t mask    = (ones << 8) - ones;     // ones * 255: 0xff per negated byte
     const uint32_t flipped = ((uint32_t) g) ^ mask;  // ones' complement of the negated bytes
     // + 1 completes the two's complement, and must not carry out of its byte -- which it would
     // for a grid byte of 0x00. Add only into the low 7 bits, where 0x7f + 1 == 0x80 still fits,

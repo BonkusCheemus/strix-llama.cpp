@@ -19,14 +19,16 @@
 //     a+1 were never tested, so they are not counted at all. That is how the
 //     censoring the EMA controller works around is handled here: an untested
 //     position is unknown, not a failure.
-//   - time per round, as a straight line in the width: t(n) = a + b*n, fitted
-//     by least squares with the same forgetting as acceptance, so it follows the
-//     context as attention gets slower. Only the fitted line is used, never a
-//     per-width table: a table entry goes stale as soon as the controller stops
-//     visiting that width, and relative-to-mean tables drift with the choice
-//     itself (the first draft of this file did that; the unit test caught it).
+//   - time per round, per WIDTH: one running average for each draft length n
+//     (t_draft) and each verify width m (t_verify). Verify time is not a line in
+//     the width on every backend: on HIP with turbo KV, widths 1-2 run the VEC
+//     FA kernel and widths 3+ convert the whole KV cache to f16 first, a step
+//     that grows with depth. A width never measured borrows its nearest measured
+//     neighbour (flat, so an untried longer draft looks no dearer: optimistic,
+//     it gets tried, the measurement corrects it).
 //   - every explore_every rounds the controller drafts one longer or one shorter
-//     than its best, so the line always has more than one width to fit.
+//     than its best; every 4th such probe goes to the width measured longest ago
+//     instead, so entries left behind by a context change get refreshed.
 //
 // An unseen position borrows the previous position's rate: optimistic, so the
 // controller tries the longer draft; the measurement then corrects it. With too
@@ -41,25 +43,42 @@
 #include <cstdint>
 #include <vector>
 
-// exponentially weighted least-squares line y = a + b*x
-struct common_spec_line {
-    double w = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+// running average of a time per integer width, with nearest-neighbour fill
+struct common_spec_width_times {
+    static constexpr double alpha = 0.3;   // weight of the newest observation
 
-    void add(double x, double y, double decay) {
-        w   = w   * decay + 1;
-        sx  = sx  * decay + x;
-        sy  = sy  * decay + y;
-        sxx = sxx * decay + x * x;
-        sxy = sxy * decay + x * y;
+    std::vector<double>  t;       // average seconds per width (index = width)
+    std::vector<int64_t> seen_at; // round of the last observation, -1 = never
+
+    void reset(int32_t w_max) {
+        t.assign(w_max + 1, 0.0);
+        seen_at.assign(w_max + 1, -1);
     }
-    double at(double x) const {
-        if (w <= 0) {
-            return 0;
+    bool any() const {
+        return std::any_of(seen_at.begin(), seen_at.end(), [](int64_t r) { return r >= 0; });
+    }
+    void add(int32_t w, double y, int64_t round) {
+        if (w < 0 || w >= (int32_t) t.size()) {
+            return;
         }
-        const double mx = sx / w, my = sy / w;
-        const double var = sxx / w - mx * mx;
-        const double b   = var > 0.05 ? std::max(0.0, (sxy / w - mx * my) / var) : 0.0;
-        return std::max(0.0, my + b * (x - mx));
+        t[w]       = seen_at[w] < 0 ? y : t[w] + alpha * (y - t[w]);
+        seen_at[w] = round;
+    }
+    double at(int32_t w) const {
+        if (w < 0 || w >= (int32_t) t.size()) {
+            return 0.0;
+        }
+        if (seen_at[w] >= 0) {
+            return t[w];
+        }
+        int32_t lo = w - 1, hi = w + 1;
+        while (lo >= 0 && seen_at[lo] < 0) --lo;
+        while (hi < (int32_t) t.size() && seen_at[hi] < 0) ++hi;
+        const bool has_lo = lo >= 0, has_hi = hi < (int32_t) t.size();
+        if (has_lo && has_hi) {
+            return t[lo] + (t[hi] - t[lo]) * (w - lo) / (double) (hi - lo);
+        }
+        return has_lo ? t[lo] : (has_hi ? t[hi] : 0.0);
     }
 };
 
@@ -76,16 +95,16 @@ struct common_spec_cost {
     std::vector<double> pass;
     std::vector<double> fail;
 
-    common_spec_line draft_line;    // t_draft(n drafted)
-    common_spec_line verify_line;   // t_verify(m = n drafted + 1)
-    int32_t          n_rounds = 0;
+    common_spec_width_times draft_t;   // t_draft(n drafted)
+    common_spec_width_times verify_t;  // t_verify(m = n drafted + 1)
+    int32_t                 n_rounds = 0;
 
     void reset(int32_t n_max_) {
         n_max = std::max(1, n_max_);
         pass.assign(n_max, 0.0);
         fail.assign(n_max, 0.0);
-        draft_line  = {};
-        verify_line = {};
+        draft_t.reset(n_max);
+        verify_t.reset(n_max + 1);
         n_rounds    = 0;
     }
 
@@ -102,8 +121,8 @@ struct common_spec_cost {
         return qk;
     }
 
-    double t_draft(int32_t n)  const { return draft_line.at(n); }
-    double t_verify(int32_t m) const { return verify_line.at(m); }
+    double t_draft(int32_t n)  const { return draft_t.at(n); }
+    double t_verify(int32_t m) const { return verify_t.at(m); }
 
     // expected tokens per second of drafting n
     double rate(int32_t n) const {
@@ -121,7 +140,7 @@ struct common_spec_cost {
     int32_t best(int32_t lo, int32_t hi) const {
         hi = std::min(hi, n_max);
         lo = std::max(1, std::min(lo, hi));
-        if (verify_line.w <= 0) {
+        if (!verify_t.any()) {
             return hi;
         }
         int32_t n_best = lo;
@@ -136,7 +155,8 @@ struct common_spec_cost {
         return n_best;
     }
 
-    // the length to draft this round: best, or a +-1 probe every explore_every rounds
+    // the length to draft this round: best, a +-1 probe every explore_every
+    // rounds, and every 4th probe the width measured longest ago
     int32_t choose(int32_t lo, int32_t hi) {
         const int32_t n = best(lo, hi);
         if (++n_rounds % explore_every != 0) {
@@ -144,7 +164,17 @@ struct common_spec_cost {
         }
         hi = std::min(hi, n_max);
         lo = std::max(1, std::min(lo, hi));
-        const int32_t step = (n_rounds / explore_every) % 2 ? 1 : -1;
+        const int32_t probe = n_rounds / explore_every;
+        if (probe % 4 == 0) {
+            int32_t n_old = lo;
+            for (int32_t k = lo; k <= hi; ++k) {
+                if (verify_t.seen_at[k + 1] < verify_t.seen_at[n_old + 1]) {
+                    n_old = k;
+                }
+            }
+            return n_old;
+        }
+        const int32_t step = probe % 2 ? 1 : -1;
         return std::max(lo, std::min(hi, n + step));
     }
 
@@ -168,8 +198,8 @@ struct common_spec_cost {
         }
 
         if (t_draft_s > 0.0 && t_verify_s > 0.0) {
-            draft_line.add(n_drafted, t_draft_s, decay);
-            verify_line.add(n_drafted + 1, t_verify_s, decay);
+            draft_t.add(n_drafted, t_draft_s, n_rounds);
+            verify_t.add(n_drafted + 1, t_verify_s, n_rounds);
         }
     }
 };

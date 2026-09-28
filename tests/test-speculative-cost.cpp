@@ -12,11 +12,14 @@ struct world {
     std::vector<double> q;              // true conditional acceptance per position
     double d0, d1, v0, v1;              // t_draft = d0 + d1*n, t_verify = v0 + v1*m (seconds)
     double noise;                       // relative timing noise
+    double jump = 0;                    // extra verify seconds at width m >= 3 (HIP turbo: VEC -> TILE + f16 KV convert)
+
+    double t_verify(int m) const { return v0 + v1 * m + (m >= 3 ? jump : 0); }
 
     double rate(int n) const {
         double e = 0, p = 1;
         for (int k = 1; k <= n; ++k) { p *= q[k - 1]; e += p; }
-        return (1 + e) / (d0 + d1 * n + v0 + v1 * (n + 1));
+        return (1 + e) / (d0 + d1 * n + t_verify(n + 1));
     }
     int best(int hi) const {
         int nb = 1;
@@ -39,7 +42,7 @@ static double run(const world & w, int n_max, int rounds, unsigned seed) {
         int a = 0;
         while (a < n && u(rng) < w.q[a]) ++a;
         const double jit = 1 + w.noise * (2 * u(rng) - 1);
-        c.observe(n, a, (w.d0 + w.d1 * n) * jit, (w.v0 + w.v1 * (n + 1)) * jit);
+        c.observe(n, a, (w.d0 + w.d1 * n) * jit, w.t_verify(n + 1) * jit);
     }
     return got / 200 / w.rate(w.best(n_max));
 }
@@ -53,9 +56,14 @@ int main() {
     // verify gets expensive per token (long context): drafting long must lose.
     world dear{{0.7, 0.6, 0.5, 0.4, 0.3, 0.3, 0.3, 0.3}, 0.001, 0.003, 0.050, 0.020, 0.05};
 
-    const world * ws[] = {&mtp, &dsp, &dear};
-    const char * names[] = {"mtp", "dspark", "dear-verify"};
-    for (int i = 0; i < 3; ++i) {
+    // verify steps up at width 3: long drafts still win once past the step (DSpark-like acceptance)
+    world step_long{{0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55}, 0.012, 0.0002, 0.060, 0.002, 0.05, 0.030};
+    // verify steps up at width 3 and acceptance is modest: drafting 1 wins
+    world step_short{{0.7, 0.6, 0.5, 0.4, 0.3, 0.3, 0.3, 0.3}, 0.0005, 0.004, 0.060, 0.002, 0.05, 0.050};
+
+    const world * ws[] = {&mtp, &dsp, &dear, &step_long, &step_short};
+    const char * names[] = {"mtp", "dspark", "dear-verify", "step-long", "step-short"};
+    for (int i = 0; i < 5; ++i) {
         double worst = 1;
         for (unsigned s = 1; s <= 20; ++s) worst = std::min(worst, run(*ws[i], 8, 400, s));
         std::printf("%-12s optimum n=%d  worst achieved rate / optimum over 20 seeds = %.3f\n",

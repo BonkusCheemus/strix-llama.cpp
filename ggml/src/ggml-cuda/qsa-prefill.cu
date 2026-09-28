@@ -196,11 +196,12 @@ __global__ __launch_bounds__(QSA3_MERGE_LANES) void qsa3_merge_kernel(
 
 struct qsa3_layout {
     size_t q1, q2, o1, o2, m1;
+    size_t knb1, vnb1, knb2, vnb2;   // raw f16 cache strides (DIRECT reads only)
     int nk, n_q, gqa, cap;
     float scale;
 };
 
-__global__ __launch_bounds__(256) void qsa3_attn_kernel(
+template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         const float * __restrict__ q, const uint16_t * __restrict__ pk, const uint16_t * __restrict__ pv,
         const uint16_t * __restrict__ mask, const uint16_t * __restrict__ ublk, const uint16_t * __restrict__ umask,
         const int * __restrict__ ucount, float * __restrict__ out, const qsa3_layout s) {
@@ -215,8 +216,17 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
     __shared__ float  l_s[48];
 
     const size_t nblk = (size_t) s.nk / 4;
-    const uint16_t * pkg = pk + (size_t) kvh * nblk * 1024;
-    const uint16_t * pvg = pv + (size_t) kvh * nblk * 1024;
+    const uint16_t * pkg = nullptr;
+    const uint16_t * pvg = nullptr;
+    const char * kbase = nullptr;
+    const char * vbase = nullptr;
+    if constexpr (DIRECT) {
+        kbase = reinterpret_cast<const char *>(pk) + (size_t) kvh * s.knb2;
+        vbase = reinterpret_cast<const char *>(pv) + (size_t) kvh * s.vnb2;
+    } else {
+        pkg = pk + (size_t) kvh * nblk * 1024;
+        pvg = pv + (size_t) kvh * nblk * 1024;
+    }
     const uint16_t * gblk = ublk + (size_t) g * s.cap;
     const uint16_t * gmsk = umask + (size_t) g * s.cap;
     const int nchunks = ucount[g] >> 2;
@@ -279,12 +289,23 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
             return;
         }
         const int kb = blk_of(b01, b23, j);
-        const uint16_t * krow = pkg + (size_t) kb * 1024 + (r & 3) * 16 + w * 128;
+        if constexpr (DIRECT) {
+            // the packed 16-half chunk at (key, w, t) is dims (2w+t)*16 .. +15 of that key's row
+            const int key = 4*kb + (r & 3);
+            const char * p = kbase + (size_t)key * s.knb1 + (size_t)((2*w) * 16) * 2;
 #pragma unroll
-        for (int t = 0; t < 2; ++t) {
-            const uint4 lo  = *reinterpret_cast<const uint4 *>(krow + t*64);
-            const uint4 hi4 = *reinterpret_cast<const uint4 *>(krow + t*64 + 8);
-            kf[t] = __builtin_bit_cast(v16s, (uint4[2]){lo, hi4});
+            for (int t = 0; t < 2; ++t) {
+                const char * q = p + (size_t)t * 32;
+                kf[t] = __builtin_bit_cast(v16s, (uint4[2]){*reinterpret_cast<const uint4 *>(q), *reinterpret_cast<const uint4 *>(q + 16)});
+            }
+        } else {
+            const uint16_t * krow = pkg + (size_t) kb * 1024 + (r & 3) * 16 + w * 128;
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                const uint4 lo  = *reinterpret_cast<const uint4 *>(krow + t*64);
+                const uint4 hi4 = *reinterpret_cast<const uint4 *>(krow + t*64 + 8);
+                kf[t] = __builtin_bit_cast(v16s, (uint4[2]){lo, hi4});
+            }
         }
     };
 
@@ -316,11 +337,27 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
                 const int d = 32*w + 16*t + r;
-                const uint2 v0 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb0 * 1024 + d * 4), m01 & 0xffffu);
-                const uint2 v1 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb1 * 1024 + d * 4), m01 >> 16);
-                const uint2 v2 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb2 * 1024 + d * 4), m23 & 0xffffu);
-                const uint2 v3 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb3 * 1024 + d * 4), m23 >> 16);
-                vf[t] = __builtin_bit_cast(v16s, (uint2[4]){v0, v1, v2, v3});
+                if constexpr (DIRECT) {
+                    // the packed uint2 holds the four keys of block kb at dim d; gather them from the rows
+                    const char * col = vbase + (size_t)d * 2;
+                    auto kv4 = [&](const int kb) -> uint2 {
+                        const char * b = col + (size_t)(4*kb) * s.vnb1;
+                        const uint32_t a0 = *reinterpret_cast<const uint16_t *>(b);
+                        const uint32_t a1 = *reinterpret_cast<const uint16_t *>(b + s.vnb1);
+                        const uint32_t a2 = *reinterpret_cast<const uint16_t *>(b + 2*s.vnb1);
+                        const uint32_t a3 = *reinterpret_cast<const uint16_t *>(b + 3*s.vnb1);
+                        return make_uint2(a0 | (a1 << 16), a2 | (a3 << 16));
+                    };
+                    vf[t] = __builtin_bit_cast(v16s, (uint2[4]){
+                        mask_values(kv4(kb0), m01 & 0xffffu), mask_values(kv4(kb1), m01 >> 16),
+                        mask_values(kv4(kb2), m23 & 0xffffu), mask_values(kv4(kb3), m23 >> 16)});
+                } else {
+                    const uint2 v0 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb0 * 1024 + d * 4), m01 & 0xffffu);
+                    const uint2 v1 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb1 * 1024 + d * 4), m01 >> 16);
+                    const uint2 v2 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb2 * 1024 + d * 4), m23 & 0xffffu);
+                    const uint2 v3 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb3 * 1024 + d * 4), m23 >> 16);
+                    vf[t] = __builtin_bit_cast(v16s, (uint2[4]){v0, v1, v2, v3});
+                }
             }
         }
         uint32_t nb01 = 0, nb23 = 0, nm01 = 0, nm23 = 0;
@@ -483,12 +520,18 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
     const auto * q=dst->src[0], * k=dst->src[1], * v=dst->src[2], * m=dst->src[3], * ids=dst->src[5];
     float scale; memcpy(&scale, dst->op_params, 4);
     const int n_q = (int) q->ne[1], ns = (int) ids->ne[0], nk = (int) k->ne[1];
-    ggml_cuda_pool_alloc<uint16_t> packed_k(ctx.pool(), ggml_nelements(k));
-    ggml_cuda_pool_alloc<uint16_t> packed_v(ctx.pool(), ggml_nelements(v));
-    const uint32_t count_k=ggml_nelements(k)/8, count_v=ggml_nelements(v)/4;
-    qsa_pack_k<<<(count_k+255)/256,256,0,ctx.stream()>>>((const char *)k->data,packed_k.get(),k->nb[1],k->nb[2],nk,count_k);
-    qsa_pack_v<<<(count_v+255)/256,256,0,ctx.stream()>>>((const char *)v->data,packed_v.get(),v->nb[1],v->nb[2],nk,count_v);
-    CUDA_CHECK(cudaGetLastError());
+    // QSA_DIRECT: -1/auto picks direct f16 reads when the attention is small against the cache
+    // (the pack is O(n_kv) per ubatch), 0 always packs, 1 always reads direct. Both paths are bit-identical.
+    static const int qsa_direct_cfg = getenv("QSA_DIRECT") ? atoi(getenv("QSA_DIRECT")) : -1;
+    const bool qsa_direct = qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 32 < (size_t) nk);
+    ggml_cuda_pool_alloc<uint16_t> packed_k(ctx.pool(), qsa_direct ? 0 : ggml_nelements(k));
+    ggml_cuda_pool_alloc<uint16_t> packed_v(ctx.pool(), qsa_direct ? 0 : ggml_nelements(v));
+    if (!qsa_direct) {
+        const uint32_t count_k=ggml_nelements(k)/8, count_v=ggml_nelements(v)/4;
+        qsa_pack_k<<<(count_k+255)/256,256,0,ctx.stream()>>>((const char *)k->data,packed_k.get(),k->nb[1],k->nb[2],nk,count_k);
+        qsa_pack_v<<<(count_v+255)/256,256,0,ctx.stream()>>>((const char *)v->data,packed_v.get(),v->nb[1],v->nb[2],nk,count_v);
+        CUDA_CHECK(cudaGetLastError());
+    }
     const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;
     const int cap = (QSA3_G * ns + 3) & ~3;
     ggml_cuda_pool_alloc<uint16_t> ublk(ctx.pool(), (size_t) ngroups * cap);
@@ -509,11 +552,18 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
                                 (const int *) srow.get(), (const int *) sflag.get(), ublk.get(), umask.get(), ucount.get(), cap);
         CUDA_CHECK(cudaGetLastError());
     }
-    qsa3_layout layout{q->nb[1], q->nb[2], dst->nb[1], dst->nb[2], m ? m->nb[1] : 0, nk, n_q, 12, cap, scale};
+    qsa3_layout layout{q->nb[1], q->nb[2], dst->nb[1], dst->nb[2], m ? m->nb[1] : 0,
+                       k->nb[1], v->nb[1], k->nb[2], v->nb[2], nk, n_q, 12, cap, scale};
     const ggml_cuda_kernel_launch_params launch(dim3(ngroups, k->ne[2]), dim3(256), 0, ctx.stream());
-    ggml_cuda_kernel_launch(qsa3_attn_kernel, launch, (const float *) q->data, packed_k.get(), packed_v.get(),
-                            m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
-                            (const int *) ucount.get(), (float *) dst->data, layout);
+    if (qsa_direct) {
+        ggml_cuda_kernel_launch(qsa3_attn_kernel<true>, launch, (const float *) q->data, (const uint16_t *) k->data, (const uint16_t *) v->data,
+                                m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
+                                (const int *) ucount.get(), (float *) dst->data, layout);
+    } else {
+        ggml_cuda_kernel_launch(qsa3_attn_kernel<false>, launch, (const float *) q->data, packed_k.get(), packed_v.get(),
+                                m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
+                                (const int *) ucount.get(), (float *) dst->data, layout);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -860,6 +860,10 @@ void process_shaders() {
 
     // TurboQuant3 KV-cache dequant and get_rows (KV-only type, not in type_names)
     string_to_spv("dequant_turbo3_0", "dequant_turbo3_0.comp", merge_maps(base_dict, {{"DATA_A_TURBO3_0", "1"}, {"D_TYPE", "float16_t"}}));
+    // Fused dequant+transpose for the FA dequant-once prefill scratch (LLM-669).
+    for (const std::string tname : {"turbo2_0", "turbo3_0", "turbo4_0"}) {
+        string_to_spv("dequant_" + tname + "_transpose", "dequant_turbo_transpose.comp", merge_maps(base_dict, {{"DATA_A_" + to_uppercase(tname), "1"}, {"D_TYPE", "float16_t"}}));
+    }
     string_to_spv("get_rows_turbo3_0", "get_rows_quant.comp", merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {"DATA_A_TURBO3_0", "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
     string_to_spv("get_rows_turbo3_0_f32", "get_rows_quant.comp", merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {"DATA_A_TURBO3_0", "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
 

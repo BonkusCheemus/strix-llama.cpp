@@ -1,0 +1,66 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+// Fused dequant+transpose for TurboQuant K/V (LLM-669), the turbo counterpart of
+// dequant_q8_0.comp built with DEQUANT_TRANSPOSE. Feeds the FA dequant-once f16
+// scratch at prefill: read [HS, NH, KV, NS], write [HS, KV, NH, NS]
+// (p.M=HS, p.K=NH, p.stride_a=KV).
+//
+// Values are centroid * norm with no inverse WHT, exactly what FA_DEQUANT4_TURBO*
+// in flash_attn_dequant.glsl returns: the graph rotates Q before attention and
+// un-rotates the FA output, so the scratch stays in the rotated domain too.
+//
+// 256 threads, 32 blocks of 128 per workgroup (4096 elements, wg_denoms 256*16,
+// same as q8_0 so the workgroup count stays far below maxComputeWorkGroupCount).
+// Each thread writes 16 consecutive elements of one block; they stay contiguous
+// after the transpose because HS is a multiple of the 128-element block.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+#if defined(DATA_A_TURBO2_0)
+    const float c[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+#elif defined(DATA_A_TURBO3_0)
+    const float c[8] = float[8](
+        -0.190685, -0.117832, -0.065717, -0.021460,
+         0.021460,  0.065717,  0.117832,  0.190685);
+#elif defined(DATA_A_TURBO4_0)
+    const float c[16] = float[16](
+        -0.241529, -0.182877, -0.143016, -0.111036,
+        -0.083292, -0.058050, -0.034299, -0.011349,
+         0.011349,  0.034299,  0.058050,  0.083292,
+         0.111036,  0.143016,  0.182877,  0.241529);
+#endif
+
+    const uint ib  = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
+    const uint sub = (gl_LocalInvocationID.x % 8) * 16;   // first element of this thread's run
+    if (ib >= p.nel / 128) {
+        return;
+    }
+
+    const uint HS = p.M, NH = p.K, KVn = p.stride_a;
+    const uint e0 = ib * 128 + sub;
+    const uint b_idx = (e0 % HS)
+                     + ((e0 / (HS * NH)) % KVn) * HS
+                     + ((e0 / HS) % NH) * (HS * KVn)
+                     + (e0 / (HS * NH * KVn)) * (HS * KVn * NH);
+
+    const float norm = float(data_a[ib].norm);
+
+    [[unroll]] for (uint l = 0; l < 16; ++l) {
+        const uint j = sub + l;
+#if defined(DATA_A_TURBO2_0)
+        const uint idx = (uint(data_a[ib].qs[j / 4]) >> ((j % 4) * 2)) & 0x3u;
+#elif defined(DATA_A_TURBO3_0)
+        const uint idx = ((uint(data_a[ib].qs[j / 4]) >> ((j % 4) * 2)) & 0x3u)
+                       | (((uint(data_a[ib].signs[j / 8]) >> (j % 8)) & 0x1u) << 2);
+#elif defined(DATA_A_TURBO4_0)
+        const uint idx = (uint(data_a[ib].qs[j / 2]) >> ((j % 2) * 4)) & 0xFu;
+#endif
+        data_b[b_idx + l] = D_TYPE(c[idx] * norm);
+    }
+}

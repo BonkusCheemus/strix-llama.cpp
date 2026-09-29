@@ -91,6 +91,7 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <cstdarg>
@@ -2100,7 +2101,60 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// GGML_HIP_OP_PROFILE=1: per-op wall time, synchronising around every op (so CUDA graphs are
+// disabled and overlap is lost; shares are what it is for, not absolute speed). Keyed by op desc
+// plus the weight type for matmuls and the K type for flash attention. Table printed at exit.
+static bool ggml_cuda_op_profile_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_HIP_OP_PROFILE"); return e && atoi(e) != 0; }();
+    return on;
+}
+
+struct ggml_cuda_op_profile {
+    std::map<std::string, std::pair<double, int64_t>> t; // key -> (seconds, calls)
+    double gap = 0.0; // time spent finishing work launched outside compute_forward (fused paths)
+    ~ggml_cuda_op_profile() {
+        std::vector<std::pair<std::string, std::pair<double, int64_t>>> v(t.begin(), t.end());
+        double total = gap;
+        for (auto & e : v) total += e.second.first;
+        if (total <= 0) return;
+        std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.second.first > b.second.first; });
+        fprintf(stderr, "\nGGML_HIP_OP_PROFILE: %.3f s total\n%-40s %10s %7s %10s\n", total, "op", "ms", "%", "calls");
+        for (auto & e : v) {
+            fprintf(stderr, "%-40s %10.1f %6.1f%% %10lld\n", e.first.c_str(), e.second.first * 1e3,
+                    100.0 * e.second.first / total, (long long) e.second.second);
+        }
+        fprintf(stderr, "%-40s %10.1f %6.1f%%\n", "(outside compute_forward)", gap * 1e3, 100.0 * gap / total);
+    }
+};
+
+static bool ggml_cuda_compute_forward_impl(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    if (!ggml_cuda_op_profile_enabled()) {
+        return ggml_cuda_compute_forward_impl(ctx, dst);
+    }
+    static ggml_cuda_op_profile prof;
+    using clk = std::chrono::steady_clock;
+    const auto t0 = clk::now();
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    const auto t1 = clk::now();
+    const bool ok = ggml_cuda_compute_forward_impl(ctx, dst);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    const auto t2 = clk::now();
+    std::string key = ggml_op_desc(dst);
+    if ((dst->op == GGML_OP_MUL_MAT || dst->op == GGML_OP_MUL_MAT_ID || dst->op == GGML_OP_GET_ROWS) && dst->src[0]) {
+        key += std::string("(") + ggml_type_name(dst->src[0]->type) + ")";
+    } else if (dst->op == GGML_OP_FLASH_ATTN_EXT && dst->src[1]) {
+        key += std::string("(K=") + ggml_type_name(dst->src[1]->type) + ")";
+    }
+    auto & e = prof.t[key];
+    e.first += std::chrono::duration<double>(t2 - t1).count();
+    e.second += 1;
+    prof.gap += std::chrono::duration<double>(t1 - t0).count();
+    return ok;
+}
+
+static bool ggml_cuda_compute_forward_impl(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     // a tensor marked BF16-only was never written as F32: any reader outside the fused paths is a bug, not a fallback
     if (ggml_cuda_mmb_marks_count(ctx) > 0 && dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID && dst->op != GGML_OP_VIEW &&
             dst->op != GGML_OP_RESHAPE && dst->op != GGML_OP_PERMUTE && dst->op != GGML_OP_TRANSPOSE && dst->op != GGML_OP_NONE) {
@@ -6079,6 +6133,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    if (ggml_cuda_op_profile_enabled()) { // per-op sync timing cannot run inside a captured graph
+        use_cuda_graph = false;
+        cuda_graph_update_required = false;
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture

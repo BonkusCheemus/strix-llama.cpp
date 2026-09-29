@@ -12853,11 +12853,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // iron's KV pair (turbo3 K, turbo4 V) at the Qwen3.8-27B shape: exercises the fused turbo MMA tile decode
-    for (int kv : { 113, 512, 1024, 4096 }) {
-        for (int nb : { 1, 2, 3, 4, 8, 16, 75 }) {
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0));
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}, false));
+    // iron KV pairs (turbo3 or turbo4 K, turbo4 V) at the Qwen3.8-27B shape: exercises the fused turbo tile decode
+    for (ggml_type type_K : { GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0 }) {
+        for (int kv : { 113, 512, 1024, 4096 }) {
+            for (int nb : { 1, 2, 3, 4, 8, 16, 75 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_K, GGML_TYPE_TURBO4_0));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_K, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}, false));
+            }
         }
     }
 

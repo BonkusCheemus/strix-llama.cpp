@@ -573,7 +573,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_turbo(
 
 // Function that performs a single iteration in for the KQ matrix multiplication:
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, bool q8_0_KV, bool turbo_KV, typename T_vec_dot>
+    bool use_logit_softcap, bool oob_check, bool q8_0_KV, int turbo_KV, typename T_vec_dot>
 static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         T_vec_dot   * const Q_tmp,
         const char  * const __restrict__ K_data,
@@ -591,7 +591,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
 
     if constexpr (turbo_KV) {
-        flash_attn_tile_load_tile_turbo<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check, GGML_TYPE_TURBO3_0>
+        flash_attn_tile_load_tile_turbo<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check, (turbo_KV == 4 ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO3_0)>
             (K_data + int64_t(k_VKQ_0)*stride_K, KV_tmp, stride_K, k_VKQ_sup, k_KQ_0);
     } else if constexpr (q8_0_KV) {
         flash_attn_tile_load_tile_q8_0<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
@@ -672,7 +672,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
 
 // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, bool q8_0_KV, bool turbo_KV, typename T_vec_dot, typename T_KQ, typename T_acc>
+    bool use_logit_softcap, bool oob_check, bool q8_0_KV, int turbo_KV, typename T_vec_dot, typename T_KQ, typename T_acc>
 static __device__ __forceinline__ void flash_attn_tile_iter(
         T_vec_dot * const Q_tmp,
         const char  * const __restrict__ K_data,
@@ -925,7 +925,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     }
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool q8_0_KV, bool turbo_KV = false> // D == head size
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool q8_0_KV, int turbo_KV = 0> // D == head size; turbo_KV: 0 off, 3 or 4 = turbo K bits (V is always turbo4)
 __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
 #if defined(RDNA3_5) && defined(GGML_CUDA_FATTN_VGPR192)
 __attribute__((amdgpu_num_vgpr(192)))
@@ -1316,16 +1316,19 @@ static void launch_fattn_tile_case(
             fattn_kernel = ggml_cuda_fattn_tile_d256_ncols32_rdna3_5(use_logit_softcap);
         }
     }
-    // turbo3 K / turbo4 V: decode inside the tile loads (RDNA3.5 device code only, like q8_0 above).
+    // turbo3 or turbo4 K / turbo4 V: decode inside the tile loads (RDNA3.5 device code only, like q8_0 above).
     if constexpr (DKQ == 256 && DV == 256) {
         static const bool turbo_fused = [] {
             const char * e = getenv("GGML_FA_TURBO_TILE_FUSED");
             return e && atoi(e) != 0;
         }();
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        if (turbo_fused && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
-                dst->src[1]->type == GGML_TYPE_TURBO3_0 && dst->src[2]->type == GGML_TYPE_TURBO4_0) {
-            fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, false, true>;
+        const ggml_type type_K = dst->src[1]->type;
+        if (turbo_fused && GGML_CUDA_CC_IS_RDNA3_5(cc) && dst->src[2]->type == GGML_TYPE_TURBO4_0 &&
+                (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0)) {
+            fattn_kernel = type_K == GGML_TYPE_TURBO4_0
+                ? flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, false, 4>
+                : flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, false, 3>;
             use_turbo_KV = true;
         }
     }

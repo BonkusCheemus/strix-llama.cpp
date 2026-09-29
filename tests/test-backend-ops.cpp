@@ -13934,7 +13934,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // turbo decode cost: Qwen3.8-27B attention shape at 32k depth for DSpark verify widths (MMA path converts all of K/V to f16)
     for (int64_t nb : {1, 2, 4, 8}) {
-        for (auto kv_types : std::vector<std::array<ggml_type, 2>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}}) {
+        for (auto kv_types : std::vector<std::array<ggml_type, 2>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0}}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 32768, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, kv_types[0], kv_types[1]));
         }
     }

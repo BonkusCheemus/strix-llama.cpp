@@ -1,12 +1,12 @@
-# halo-box/llama.cpp
+# strix-llama.cpp
 
 <img src="halo-box.png" alt="Halo Box" width="260">
 
-<b>llama.cpp, close to mainline, with more</b>
+<b>llama.cpp for AMD Strix Halo</b>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-[upstream llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml) / [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp)
+[upstream llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml) / [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp)
 
 ## Halo Box
 
@@ -15,27 +15,29 @@ llama.cpp fork instead of many competing ones.
 
 ## What this is
 
-A community fork of [`llama.cpp`](https://github.com/ggml-org/llama.cpp) that stays close to mainline. It tracks
-upstream `master`, merges it in regularly, and adds features and speedups on top without changing how upstream
-behaves. Upstream behaviour is unchanged - this is a superset, not a rewrite.
+A community fork of [`llama.cpp`](https://github.com/ggml-org/llama.cpp) for **AMD Strix Halo** - the Ryzen AI Max / Max+ 300 series
+APUs (`gfx1151`, RDNA 3.5 integrated GPU, up to 128 GB of unified LPDDR5X shared between CPU and GPU).
 
-It is also the staging fork for the pair: anything general enough for upstream is developed here, on `halo/*`
-branches, and submitted to `ggml-org/llama.cpp` from here under the upstream project's contribution and AI-usage
-rules. What stays here is either not yet ready to go up, or too niche for mainline. Work that only makes sense on
-AMD Strix Halo lives in [strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) instead.
+Strix Halo is an unusual target. It has more addressable memory than almost any consumer discrete GPU, and far less
+bandwidth; the iGPU shares its memory controller with the CPU; and both the Vulkan (RADV) and ROCm/HIP paths have
+RDNA 3.5 specific behaviour that upstream has no hardware to reproduce. Changes that only make sense on this one
+device - or that need a lot of measurement on it before they are ready to propose anywhere else - live here.
+
+Practically, that means this repo has its own rules - most visibly, **AI coding agents may open pull requests here**.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md).
 
 ## Quick start
 
-Build from source. For example:
+Build from source. Two backends are worth using on Strix Halo:
 
-**Vulkan** (works on any recent GPU; on AMD, RADV on Mesa is the easiest path)
+**Vulkan** (RADV on Mesa; the easiest path, and the best one for most models)
 
 ```sh
 cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j
 ```
 
-**ROCm / HIP** (needs ROCm installed; set `GPU_TARGETS` to your GPU, `gfx1151` is Strix Halo)
+**ROCm / HIP** (needs ROCm installed; build for `gfx1151` explicitly)
 
 ```sh
 HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
@@ -63,11 +65,19 @@ it map. Two things control this: the UMA / dedicated-VRAM split in your BIOS, an
 need depends on your kernel version - newer kernels size GTT more generously on their own. If a model that clearly
 fits in RAM fails to allocate, this is almost always why.
 
-**Measure things.** `GGML_VK_PERF_LOGGER=1` (any value) gives per-op timings on the Vulkan backend. `llama-bench`
-and `llama-perplexity` are the tools for before/after numbers, and performance PRs here are expected to carry them.
+**ROCm and batched inference.** On `gfx1151` there is an async-execution correctness bug in the HIP path: batched
+inference can return badly wrong output (perplexity ~88 against ~9.4 for the same model). Setting
+`HIP_LAUNCH_BLOCKING=1` serializes kernel launches and restores correctness, at a performance cost. Our ROCm CI runs
+with it set. It is a workaround for a ROCm/HIP issue, not a fix, and it should go away when that is fixed upstream.
 
-Strix Halo specific notes and tuning (ROCm workarounds, Vulkan mat-vec chunking) are in the
-[strix-llama.cpp README](https://github.com/halo-box/strix-llama.cpp#running-on-strix-halo).
+**Vulkan mat-vec chunking.** Batched mat-vec at 3, 5 and 6 columns is several times slower than at 1, 2 and 4 on RADV
+here, which hits speculative decoding hard (it verifies at exactly those batch sizes). This fork splits such batches
+into column counts that are measured to scale. Set `GGML_VK_MMV_NO_SPLIT=1` to restore the single upstream dispatch,
+e.g. to compare against it.
+
+**Measure things.** `GGML_VK_PERF_LOGGER=1` (any value) gives per-op timings on the Vulkan backend and is how most of the findings
+above were made. `llama-bench` and `llama-perplexity` are the tools for before/after numbers, and PRs here are
+expected to carry them - see [Benchmarking requirements](CONTRIBUTING.md#benchmarking-requirements).
 
 ## What differs from upstream
 
@@ -97,9 +107,9 @@ Run `--help`, or see [tools/server/README.md](tools/server/README.md), for the f
 
 ## Supported backends
 
-All of upstream's, unmodified:
+The ones that matter on this hardware:
 
-| Backend | Target devices |
+| Backend | Notes |
 | --- | --- |
 | [Vulkan](docs/build.md#vulkan) | RADV on the RDNA 3.5 iGPU - the default recommendation |
 | [HIP](docs/build.md#hip) | ROCm on `gfx1151` - see the `HIP_LAUNCH_BLOCKING` note above |
@@ -109,8 +119,6 @@ All of upstream's, unmodified:
 
 `llama.cpp` supports many more (CUDA, Metal, SYCL, CANN, OpenCL, WebGPU, ...); they are all still present in the tree
 and unmodified. See the [upstream README](https://github.com/ggml-org/llama.cpp) for that list.
-
-Most of the work in this fork is measured on AMD Strix Halo (Vulkan and HIP), and CI runs the standard upstream matrix.
 
 ## Documentation
 
@@ -133,15 +141,18 @@ Most of the work in this fork is measured on AMD Strix Halo (Vulkan and HIP), an
 
 ## Contributing
 
-This is a small community project. A benchmark, a bug report, or a patch is exactly what it is for.
+This is a small community project. Strix Halo owners with a benchmark, a bug report, or a patch are exactly who it is
+for.
 
-- This repo follows the upstream contribution and AI-usage rules, because what lands here is meant to go upstream.
-  See [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md); in short, understand every line you submit.
-- Performance claims need numbers against a baseline you built and ran yourself, on the same machine in the same
-  session.
-- If your change is Strix Halo specific, send it to [strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp)
-  instead; that repo has its own, more permissive rules.
-- Work lands on `halo/*` branches, and upstream is merged in regularly.
+- Anyone can open a PR, **including AI coding agents acting on their own** - this repo permits automated PR submission,
+  unlike upstream. The rules that replace the upstream ban are in [AGENTS.md](AGENTS.md).
+- Device-specific claims need numbers from the device, against a baseline you built and ran yourself. What exactly to
+  report is in [Benchmarking requirements](CONTRIBUTING.md#benchmarking-requirements); read it before you benchmark.
+- If your change is not Strix Halo specific, send it to [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp)
+  instead, so it can reach upstream.
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before your first PR.
+
+CI runs the standard llama.cpp suite plus a self-hosted `gfx1151` ROCm job on real hardware.
 
 ## Acknowledgements
 

@@ -283,14 +283,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
             n_embd_head,     n_head_kv,
             n_embd_head,     n_head_kv,
             il, false);
-    if (cparams.embeddings_nextn && n_tokens <= 16 && Qcur_full->op == GGML_OP_MUL_MAT) {
-        ggml_mul_mat_set_hint(Qcur_full, GGML_HINT_EXACT_BATCH);
-    }
-    if (cparams.embeddings_nextn && n_tokens <= 16 && Kcur->op == GGML_OP_MUL_MAT) {
-        ggml_mul_mat_set_hint(Kcur, GGML_HINT_EXACT_BATCH);
-    }
-    if (cparams.embeddings_nextn && n_tokens <= 16 && Vcur->op == GGML_OP_MUL_MAT) {
-        ggml_mul_mat_set_hint(Vcur, GGML_HINT_EXACT_BATCH);
+    if (cparams.embeddings_nextn && n_tokens <= 16) {
+        for (ggml_tensor * projection : { Qcur_full, Kcur, Vcur }) {
+            while (projection->view_src != nullptr || projection->op == GGML_OP_CONT) {
+                projection = projection->src[0];
+            }
+            if (projection->op == GGML_OP_MUL_MAT) {
+                ggml_mul_mat_set_hint(projection, GGML_HINT_EXACT_BATCH);
+            }
+        }
     }
     cb(Qcur_full, "Qcur_full", il);
     cb(Kcur, "Kcur", il);

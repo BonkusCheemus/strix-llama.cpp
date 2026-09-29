@@ -12853,6 +12853,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // iron's KV pair (turbo3 K, turbo4 V) at the Qwen3.8-27B shape: exercises the fused turbo MMA tile decode
+    for (int kv : { 113, 512, 1024, 4096 }) {
+        for (int nb : { 1, 2, 3, 4, 8, 16, 75 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}, false));
+        }
+    }
+
     // dense-permuted K/V (model KV-cache layout, engages the f16 contiguize path at nb>=64)
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 1024, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(96, 96, 8, {4, 1}, 512, 80, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
@@ -13924,6 +13932,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // turbo decode cost: Qwen3.8-27B attention shape at 32k depth for DSpark verify widths (MMA path converts all of K/V to f16)
+    for (int64_t nb : {1, 2, 4, 8}) {
+        for (auto kv_types : std::vector<std::array<ggml_type, 2>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 32768, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, kv_types[0], kv_types[1]));
+        }
+    }
     // LLM-753: Qwen3.8-27B full-attention prefill shape (24 Q heads, 4 KV heads, D=256), 512-token ubatch at depth
     for (int64_t kv : {4096, 45056}) {
         for (auto kv_types : std::vector<std::array<ggml_type, 2>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}}) {

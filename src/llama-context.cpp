@@ -334,6 +334,13 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
+    // LLAMA_FUSED_DSV4_HC_PRE=0 / LLAMA_FUSED_DSV4_HC_POST=0 keep the unfused hyper-connection graph
+    if (const char * env = getenv("LLAMA_FUSED_DSV4_HC_PRE")) {
+        cparams.fused_dsv4_hc_pre = atoi(env) != 0;
+    }
+    if (const char * env = getenv("LLAMA_FUSED_DSV4_HC_POST")) {
+        cparams.fused_dsv4_hc_post = atoi(env) != 0;
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;

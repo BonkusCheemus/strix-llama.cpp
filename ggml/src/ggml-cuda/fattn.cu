@@ -410,6 +410,19 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_CASE(128, type_K_case, type_V_case)       \
     FATTN_VEC_CASE(256, type_K_case, type_V_case)       \
 
+// TurboQuant KV (LLM-739, from TheTom/llama-cpp-turboquant): runtime-only KV types outside
+// GGML_CUDA_FA_QUANTS, so their instances are always compiled (ggml/cmake/common.cmake) and
+// their cases carry no GGML_CUDA_FA_<K>_<V> gate.
+#define FATTN_VEC_CASE_TURBO(D, type_K_case, type_V_case)                                          \
+    if (head_size == (D) && type_K == GGML_TYPE_##type_K_case && type_V == GGML_TYPE_##type_V_case) { \
+        return ggml_cuda_flash_attn_ext_vec_case<D, GGML_TYPE_##type_K_case, GGML_TYPE_##type_V_case>; \
+    }
+
+#define FATTN_VEC_CASES_ALL_D_TURBO(type_K_case, type_V_case) \
+    FATTN_VEC_CASE_TURBO( 64, type_K_case, type_V_case)       \
+    FATTN_VEC_CASE_TURBO(128, type_K_case, type_V_case)       \
+    FATTN_VEC_CASE_TURBO(256, type_K_case, type_V_case)
+
 typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // Vector kernel for the given head size and K/V types, nullptr if its template instance was not compiled:
@@ -470,6 +483,28 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q8_0, BF16)
     FATTN_VEC_CASES_ALL_D(BF16, BF16)
 
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO3_0, TURBO4_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO4_0, TURBO4_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO3_0, TURBO3_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO2_0, TURBO2_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO4_0, TURBO3_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO2_0, TURBO3_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO3_0, TURBO2_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO2_0, TURBO4_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO4_0, TURBO2_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO2_0, Q8_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO3_0, Q8_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO4_0, Q8_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(Q8_0, TURBO2_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(Q8_0, TURBO3_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(Q8_0, TURBO4_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO2_0, F16)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO3_0, F16)
+    FATTN_VEC_CASES_ALL_D_TURBO(TURBO4_0, F16)
+    FATTN_VEC_CASES_ALL_D_TURBO(F16, TURBO2_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(F16, TURBO3_0)
+    FATTN_VEC_CASES_ALL_D_TURBO(F16, TURBO4_0)
+
     return nullptr;
 }
 
@@ -507,6 +542,9 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:

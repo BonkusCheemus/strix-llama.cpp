@@ -522,11 +522,15 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q8_0(
 template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, ggml_type type>
 static __device__ __forceinline__ void flash_attn_tile_load_tile_turbo(
         const char * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int stride_KV, const int i_sup, const int e_off) {
-    static_assert(J % 4 == 0, "bad J");
+    static_assert(J % 8 == 0, "bad J");
     static_assert(type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0, "bad turbo type");
 
+    // 8 values per thread: one 16-bit (turbo3) or 2x16-bit (turbo4) qs load instead of one byte load per 2-4 values,
+    // one norm load per 8 values, and one wide LDS store. Blocks are 14/66 bytes, so global loads are 2-byte aligned only.
     constexpr int nthreads = warp_size*nwarps;
-    constexpr int groups_per_row = J/4;
+    constexpr int groups_per_row = J/8;
+    constexpr int row_h2 = J/2 + J_padding;
+    constexpr int st_align = row_h2 % 4 == 0 ? 0 : (row_h2 % 2 == 0 ? 8 : 4); // LDS row start: 16, 8 or 4 bytes
     const int tid = threadIdx.y*warp_size + threadIdx.x;
 
     // Codebook in LDS: a __constant__ table read with a divergent index serializes.
@@ -540,34 +544,40 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_turbo(
 #pragma unroll
     for (int ig = tid; ig < I*groups_per_row; ig += nthreads) {
         const int i = ig/groups_per_row;
-        const int j = (ig % groups_per_row)*4;
+        const int j = (ig % groups_per_row)*8;
 
-        half2 v0 = make_half2(0.0f, 0.0f);
-        half2 v1 = make_half2(0.0f, 0.0f);
+        __align__(16) half2 v[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
         if (!oob_check || i < i_sup) {
-            const int e = e_off + j;
-            // 4 values per group: turbo3 = one qs byte + 4 sign bits, turbo4 = two qs bytes.
+            const int e = e_off + j; // multiple of 8: a group never straddles a 128-value block
             if constexpr (type == GGML_TYPE_TURBO3_0) {
+                // 8 values = two qs bytes (2 low bits each) + one signs byte (high bit each).
                 const block_turbo3_0 * b = (const block_turbo3_0 *) (KV + int64_t(i)*stride_KV) + e/QK_TURBO3;
                 const int jj = e % QK_TURBO3;
                 const float n = __half2float(b->norm);
-                const int q  = b->qs[jj/4];
-                const int sg = b->signs[jj/8] >> (jj % 8);
-                v0 = make_half2(__float2half(cb[((q >> 0) & 3) | ((sg << 2) & 4)] * n), __float2half(cb[((q >> 2) & 3) | ((sg << 1) & 4)] * n));
-                v1 = make_half2(__float2half(cb[((q >> 4) & 3) | ((sg >> 0) & 4)] * n), __float2half(cb[((q >> 6) & 3) | ((sg >> 1) & 4)] * n));
+                uint16_t q;
+                ggml_cuda_memcpy_1<2>(&q, b->qs + jj/4);
+                const int sg = b->signs[jj/8];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const int a = 2*k, c = 2*k + 1;
+                    v[k] = make_half2(__float2half(cb[((q >> 2*a) & 3) | (((sg >> a) & 1) << 2)] * n),
+                                      __float2half(cb[((q >> 2*c) & 3) | (((sg >> c) & 1) << 2)] * n));
+                }
             } else {
+                // 8 values = four qs bytes, low nibble first.
                 const block_turbo4_0 * b = (const block_turbo4_0 *) (KV + int64_t(i)*stride_KV) + e/QK_TURBO4;
                 const int jj = e % QK_TURBO4;
                 const float n = __half2float(b->norm);
-                const int q0 = b->qs[jj/2 + 0];
-                const int q1 = b->qs[jj/2 + 1];
-                v0 = make_half2(__float2half(cb[q0 & 15] * n), __float2half(cb[q0 >> 4] * n));
-                v1 = make_half2(__float2half(cb[q1 & 15] * n), __float2half(cb[q1 >> 4] * n));
+                uint32_t q;
+                ggml_cuda_memcpy_1<4, 2>(&q, b->qs + jj/2);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    v[k] = make_half2(__float2half(cb[(q >> 8*k) & 15] * n), __float2half(cb[(q >> (8*k + 4)) & 15] * n));
+                }
             }
         }
 
-        tile_KV[i*(J/2 + J_padding) + j/2 + 0] = v0;
-        tile_KV[i*(J/2 + J_padding) + j/2 + 1] = v1;
+        ggml_cuda_memcpy_1<sizeof(v), st_align>(tile_KV + i*row_h2 + j/2, v);
     }
 }
 

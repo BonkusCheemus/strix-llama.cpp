@@ -410,7 +410,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_CASE(128, type_K_case, type_V_case)       \
     FATTN_VEC_CASE(256, type_K_case, type_V_case)       \
 
-// TurboQuant KV (LLM-739, from TheTom/llama-cpp-turboquant): runtime-only KV types outside
+// TurboQuant KV (from TheTom/llama-cpp-turboquant): runtime-only KV types outside
 // GGML_CUDA_FA_QUANTS, so their instances are always compiled (ggml/cmake/common.cmake) and
 // their cases carry no GGML_CUDA_FA_<K>_<V> gate.
 #define FATTN_VEC_CASE_TURBO(D, type_K_case, type_V_case)                                          \

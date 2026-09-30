@@ -14,15 +14,10 @@
 //   1. Apply s_first elementwise
 //   2. Radix-2 Hadamard butterfly (log2(group_size) stages, in-place)
 //   3. Normalize by 1/sqrt(group_size) and apply s_second elementwise
-//
-// InnerQ scale_inv: when non-null, applies per-channel inverse scaling for
-// Q/V equalization. For forward (Q rotation): multiply BEFORE signs+WHT.
-// For inverse (V un-rotation): multiply AFTER WHT+signs.
 
 template <int direction, int group_size>
 static __global__ void k_turbo_wht_f32(const float * __restrict__ src,
                                         float * __restrict__ dst,
-                                        const float * __restrict__ scale_inv,
                                         int64_t n_groups,
                                         int64_t head_dim,
                                         int64_t groups_per_head) {
@@ -44,12 +39,6 @@ static __global__ void k_turbo_wht_f32(const float * __restrict__ src,
     // Load from global memory
     x[t] = src[base + t];
     __syncthreads();
-
-    // InnerQ forward: apply scale_inv BEFORE signs+WHT (for Q pre-rotation)
-    if (direction == 0 && scale_inv != nullptr) {
-        x[t] *= scale_inv[t % group_size];
-        __syncthreads();
-    }
 
     // Apply first sign array
     if (group_size == 128) {
@@ -106,11 +95,6 @@ static __global__ void k_turbo_wht_f32(const float * __restrict__ src,
             ((direction == 0) ? TURBO_WHT_SIGNS2_64[t] : TURBO_WHT_SIGNS1_64[t]);
     }
 
-    // InnerQ inverse: apply scale_inv AFTER WHT+signs (for V un-rotation)
-    if (direction == 1 && scale_inv != nullptr) {
-        result *= scale_inv[t % group_size];
-    }
-
     dst[base + t] = result;
 }
 
@@ -130,7 +114,6 @@ static __device__ __forceinline__ float turbo_wht_sign_flip(float x, unsigned bi
 template <int direction, int warps_per_block>
 static __global__ void k_turbo_wht_f32_fast(const float * __restrict__ src,
                                             float * __restrict__ dst,
-                                            const float * __restrict__ scale_inv,
                                             int64_t n_groups,
                                             int64_t head_dim,
                                             int64_t groups_per_head) {
@@ -147,12 +130,6 @@ static __global__ void k_turbo_wht_f32_fast(const float * __restrict__ src,
     const int64_t base        = head_idx * head_dim + grp_in_head * 128;
 
     float4 v = *((const float4 *) (src + base) + lane);
-
-    // InnerQ forward: scale before signs+WHT, as in the original kernel.
-    if (direction == 0 && scale_inv != nullptr) {
-        const float4 s = *((const float4 *) scale_inv + lane);
-        v.x *= s.x; v.y *= s.y; v.z *= s.z; v.w *= s.w;
-    }
 
     // Lane t's elements share word t>>3; their bits are the nibble at 4*(t&7).
     {
@@ -204,12 +181,6 @@ static __global__ void k_turbo_wht_f32_fast(const float * __restrict__ src,
         v.w = turbo_wht_sign_flip(v.w * inv_sqrt, (nib >> 3) & 1u);
     }
 
-    // InnerQ inverse: scale after WHT+signs, as in the original kernel.
-    if (direction == 1 && scale_inv != nullptr) {
-        const float4 s = *((const float4 *) scale_inv + lane);
-        v.x *= s.x; v.y *= s.y; v.z *= s.z; v.w *= s.w;
-    }
-
     *((float4 *) (dst + base) + lane) = v;
 }
 
@@ -234,7 +205,6 @@ static __global__ void k_turbo_wht_copy_tail(const float * __restrict__ src,
 
 void ggml_cuda_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src = dst->src[0];
-    const ggml_tensor * scale_tensor = dst->src[1];  // InnerQ scale_inv (may be NULL)
 
     GGML_ASSERT(src->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
@@ -256,20 +226,17 @@ void ggml_cuda_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const float * src_ptr = (const float *) src->data;
     float       * dst_ptr = (float       *) dst->data;
-    const float * scale_inv_ptr = scale_tensor ? (const float *) scale_tensor->data : nullptr;
 
     cudaStream_t stream = ctx.stream();
 
     // Process full groups
     if (n_groups > 0) {
         // The fast kernel covers the shape the KV cache uses; other group sizes
-        // keep the original. Note scale_inv is non-null on every ordinary run:
-        // the KV cache allocates the InnerQ tensor unconditionally.
+        // keep the original.
         const bool fast_ok =
             group_size == 128 &&
             (head_dim % 4) == 0 &&                                          // float4 indexing
-            (((uintptr_t) src_ptr | (uintptr_t) dst_ptr) % 16) == 0 &&      // float4 alignment
-            (scale_inv_ptr == nullptr || ((uintptr_t) scale_inv_ptr % 16) == 0);
+            (((uintptr_t) src_ptr | (uintptr_t) dst_ptr) % 16) == 0;        // float4 alignment
 
         dim3 blocks(n_groups);
 
@@ -278,23 +245,23 @@ void ggml_cuda_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             constexpr int warps = 4;
             const int64_t n_blocks = (n_groups + warps - 1) / warps;
             if (direction == 0) {
-                k_turbo_wht_f32_fast<0, warps><<<(int) n_blocks, warps*32, 0, stream>>>(src_ptr, dst_ptr, scale_inv_ptr, n_groups, head_dim, groups_per_head);
+                k_turbo_wht_f32_fast<0, warps><<<(int) n_blocks, warps*32, 0, stream>>>(src_ptr, dst_ptr, n_groups, head_dim, groups_per_head);
             } else {
-                k_turbo_wht_f32_fast<1, warps><<<(int) n_blocks, warps*32, 0, stream>>>(src_ptr, dst_ptr, scale_inv_ptr, n_groups, head_dim, groups_per_head);
+                k_turbo_wht_f32_fast<1, warps><<<(int) n_blocks, warps*32, 0, stream>>>(src_ptr, dst_ptr, n_groups, head_dim, groups_per_head);
             }
         } else if (group_size == 128) {
             dim3 threads(128);
             if (direction == 0) {
-                k_turbo_wht_f32<0, 128><<<blocks, threads, 0, stream>>>(src_ptr, dst_ptr, scale_inv_ptr, n_groups, head_dim, groups_per_head);
+                k_turbo_wht_f32<0, 128><<<blocks, threads, 0, stream>>>(src_ptr, dst_ptr, n_groups, head_dim, groups_per_head);
             } else {
-                k_turbo_wht_f32<1, 128><<<blocks, threads, 0, stream>>>(src_ptr, dst_ptr, scale_inv_ptr, n_groups, head_dim, groups_per_head);
+                k_turbo_wht_f32<1, 128><<<blocks, threads, 0, stream>>>(src_ptr, dst_ptr, n_groups, head_dim, groups_per_head);
             }
         } else {
             dim3 threads(64);
             if (direction == 0) {
-                k_turbo_wht_f32<0, 64><<<blocks, threads, 0, stream>>>(src_ptr, dst_ptr, scale_inv_ptr, n_groups, head_dim, groups_per_head);
+                k_turbo_wht_f32<0, 64><<<blocks, threads, 0, stream>>>(src_ptr, dst_ptr, n_groups, head_dim, groups_per_head);
             } else {
-                k_turbo_wht_f32<1, 64><<<blocks, threads, 0, stream>>>(src_ptr, dst_ptr, scale_inv_ptr, n_groups, head_dim, groups_per_head);
+                k_turbo_wht_f32<1, 64><<<blocks, threads, 0, stream>>>(src_ptr, dst_ptr, n_groups, head_dim, groups_per_head);
             }
         }
     }

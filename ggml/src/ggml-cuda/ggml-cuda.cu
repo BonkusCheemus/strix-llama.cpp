@@ -7764,7 +7764,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_SET_ROWS:
             {
-                // TurboQuant KV (LLM-739): turbo2/3 need head_dim % 64, turbo4 (block 128) % 128.
+                // TurboQuant KV: turbo2/3 need head_dim % 64, turbo4 (block 128) % 128.
                 if ((op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0) && op->src[0]->ne[0] % 64 != 0) {
                     return false;
                 }

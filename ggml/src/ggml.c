@@ -1156,7 +1156,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV7",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
-    "TURBO_WHT",
     "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
@@ -1176,6 +1175,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "TURBO_WHT",
 };
 
 static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
@@ -1272,7 +1273,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
-    "turbo_wht(a)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
@@ -1292,6 +1292,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "turbo_wht(a)",
 };
 
 static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
@@ -6529,8 +6531,7 @@ struct ggml_tensor * ggml_turbo_wht(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         int                   direction,
-        int                   group_size,
-        struct ggml_tensor  * scale) {
+        int                   group_size) {
     GGML_ASSERT(ggml_is_contiguous(a));
     GGML_ASSERT(a->type == GGML_TYPE_F32);
     GGML_ASSERT(direction == 0 || direction == 1);
@@ -6546,7 +6547,6 @@ struct ggml_tensor * ggml_turbo_wht(
 
     result->op = GGML_OP_TURBO_WHT;
     result->src[0] = a;
-    result->src[1] = scale;  // InnerQ scale_inv (NULL = no scaling)
 
     // Store direction and group_size in op_params
     memcpy(result->op_params + 0, &direction, sizeof(int));

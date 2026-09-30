@@ -9533,7 +9533,7 @@ struct test_turbo_wht : public test_case {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, n_heads);
         ggml_set_param(a);
         ggml_set_name(a, "a");
-        ggml_tensor * out = ggml_turbo_wht(ctx, a, direction, 0, nullptr);
+        ggml_tensor * out = ggml_turbo_wht(ctx, a, direction, 0);
         ggml_set_name(out, "out");
         return out;
     }
@@ -9560,8 +9560,8 @@ struct test_turbo_wht_roundtrip : public test_case {
         ggml_set_param(a);
         ggml_set_name(a, "a");
         // forward WHT (direction=0), then inverse WHT (direction=1)
-        ggml_tensor * fwd = ggml_turbo_wht(ctx, a, 0, 0, nullptr);
-        ggml_tensor * inv = ggml_turbo_wht(ctx, fwd, 1, 0, nullptr);
+        ggml_tensor * fwd = ggml_turbo_wht(ctx, a, 0, 0);
+        ggml_tensor * inv = ggml_turbo_wht(ctx, fwd, 1, 0);
         ggml_set_name(inv, "out");
         return inv;
     }

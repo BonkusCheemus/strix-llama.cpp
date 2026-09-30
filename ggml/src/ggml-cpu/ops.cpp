@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -11,16 +12,6 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
-
-extern "C" {
-// Declaration only. The definition lives in ggml-turbo-quant.c (libggml-base).
-// Without `extern` this is a second definition in libggml-cpu, so the SET_ROWS
-// handler here and the quantizer there operate on different variables. Whether
-// the two happen to unify is a property of the platform's symbol resolution
-// (ELF interposition may merge them; two-level-namespace and DLL targets will
-// not), which made the group-size propagation silently link-order dependent.
-GGML_API int turbo3_cpu_wht_group_size;
-}
 
 // ggml_compute_forward_dup
 
@@ -5295,14 +5286,21 @@ static void ggml_compute_forward_set_rows_impl(
 
     const size_t rs = ggml_row_size(src0->type, nc);
 
-    ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    ggml_from_float_t const from_float_type = ggml_get_type_traits_cpu(dst->type)->from_float;
 
-    // For turbo types: communicate WHT group size to the quantize function via global
-    if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0) {
-        int gs = 0;
-        memcpy(&gs, dst->op_params, sizeof(int));
-        turbo3_cpu_wht_group_size = (gs == 64 || gs == 128) ? gs : 0;
+    // turbo2/3 take the WHT group size from the op params, passed per call (no shared state).
+    int turbo_gs = 0;
+    if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0) {
+        memcpy(&turbo_gs, dst->op_params, sizeof(int));
+        turbo_gs = (turbo_gs == 64 || turbo_gs == 128) ? turbo_gs : 0;
     }
+    auto from_float = [&](const float * x, void * y, int64_t k) {
+        switch (dst->type) {
+            case GGML_TYPE_TURBO2_0: quantize_row_turbo2_0_gs(x, y, k, turbo_gs); break;
+            case GGML_TYPE_TURBO3_0: quantize_row_turbo3_0_gs(x, y, k, turbo_gs); break;
+            default:                 from_float_type(x, y, k);                   break;
+        }
+    };
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
@@ -11485,10 +11483,8 @@ static void ggml_compute_forward_turbo_wht_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     const ggml_tensor * src = dst->src[0];
-    const ggml_tensor * scale_tensor = dst->src[1];  // InnerQ scale_inv (may be NULL)
     const float * src_data = (const float *) src->data;
     float * dst_data = (float *) dst->data;
-    const float * scale_inv = scale_tensor ? (const float *) scale_tensor->data : NULL;
 
     int direction;
     int group_size;
@@ -11521,12 +11517,7 @@ static void ggml_compute_forward_turbo_wht_f32(
         float x[128];  // max group_size
         const float * in = src_data + base;
 
-        // InnerQ forward: apply scale_inv BEFORE signs+WHT (for Q pre-rotation)
-        if (direction == 0 && scale_inv != NULL) {
-            for (int i = 0; i < group_size; i++) x[i] = in[i] * scale_inv[i % group_size];
-        } else {
-            for (int i = 0; i < group_size; i++) x[i] = in[i];
-        }
+        for (int i = 0; i < group_size; i++) x[i] = in[i];
 
         // Apply first signs
         for (int i = 0; i < group_size; i++) x[i] *= s_first[i];
@@ -11545,12 +11536,7 @@ static void ggml_compute_forward_turbo_wht_f32(
         // Normalize + second signs
         float * out = dst_data + base;
         for (int i = 0; i < group_size; i++) {
-            float val = x[i] * inv_sqrt * s_second[i];
-            // InnerQ inverse: apply scale_inv AFTER WHT+signs (for V un-rotation)
-            if (direction == 1 && scale_inv != NULL) {
-                val *= scale_inv[i % group_size];
-            }
-            out[i] = val;
+            out[i] = x[i] * inv_sqrt * s_second[i];
         }
     }
 

@@ -429,9 +429,6 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV cache: WHT + 2-bit PolarQuant (runtime-only KV type)
-        GGML_TYPE_TURBO3_0 = 44, // TurboQuant 3-bit KV cache: WHT + 3-bit PolarQuant (runtime-only KV type)
-        GGML_TYPE_TURBO4_0 = 47, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant (runtime-only KV type)
         GGML_TYPE_Q2_0    = 42,
         // ROCmFPx experimental AMD-native formats. These are kept in a high ID
         // range so upstream type IDs stay free for future ggml types.
@@ -444,7 +441,11 @@ extern "C" {
         // left unassigned here so a GGUF from that tree is rejected rather than misread.
         // Note ciru-ai/ROCmFPX diverges: it puts Q7_0_ROCMFPX at 107 and Q2_0_ROCMFPX at 108.
         GGML_TYPE_Q2_0_ROCMFPX      = 107, // ROCmFPx experimental 2-bit S40 codebook + dual UE4M3 scales
-        GGML_TYPE_COUNT   = 108,
+        // TurboQuant KV cache types (WHT rotation + PolarQuant codebook), runtime-only.
+        GGML_TYPE_TURBO2_0          = 109, // 2-bit
+        GGML_TYPE_TURBO3_0          = 110, // 3-bit
+        GGML_TYPE_TURBO4_0          = 111, // 4-bit
+        GGML_TYPE_COUNT   = 112,
     };
 
     // [TAG_GGML_PREC]
@@ -607,7 +608,6 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
-        GGML_OP_TURBO_WHT,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -627,6 +627,8 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_TURBO_WHT, // appended last so RPC op numbers stay stable
 
         GGML_OP_COUNT,
     };
@@ -2703,8 +2705,7 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   direction,
-            int                   group_size,    // 0 = auto (64 or 128 from ne[0])
-            struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
+            int                   group_size);   // 0 = auto (64 or 128 from ne[0])
 
     // DSA lightning indexer
     //

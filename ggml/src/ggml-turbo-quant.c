@@ -4,6 +4,9 @@
  *
  * Implements GGML_TYPE_TURBO2_0 (2-bit), GGML_TYPE_TURBO3_0 (3-bit) and
  * GGML_TYPE_TURBO4_0 (4-bit) for use as --cache-type-k turboN in llama-server.
+ *
+ * Adapted from TheTom/llama-cpp-turboquant (MIT, Copyright (c) 2023-2026 The ggml authors);
+ * see licenses/LICENSE-turboquant.
  */
 
 #include "ggml-quants.h"
@@ -24,12 +27,6 @@
  * -Wmissing-prototypes under upstream CI's -Werror policy). */
 GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
 
-/* Global: WHT group size for CPU quantize path (set by CPU SET_ROWS handler) */
-/* Declared with GGML_API so the symbol carries dllexport/visibility, then
- * defined plainly: `GGML_API` now expands with `extern` on every path, and
- * `extern int x = 0;` is rejected under -Werror (-Wextern-initializer). */
-GGML_API int turbo3_cpu_wht_group_size;
-int turbo3_cpu_wht_group_size = 0;
 
 /* ---------- constants ---------- */
 
@@ -279,12 +276,14 @@ GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size) {
 /* ---------- TURBO3_0: 3-bit PolarQuant with WHT rotation ---------- */
 
 void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_turbo3_0_gs(x, y, k, 0);
+}
+
+// group_size: WHT group (64 or 128) from the SET_ROWS op params; 0 = 128 if the row is 128-aligned, else 64.
+void quantize_row_turbo3_0_gs(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k, int group_size) {
+    block_turbo3_0 * GGML_RESTRICT y = (block_turbo3_0 *) vy;
     assert(k % QK_TURBO3 == 0);
 
-    // Read WHT group size from global (set by CPU SET_ROWS handler before each call).
-    // Fallback: 128 if row is 128-aligned, else 64.
-    extern int turbo3_cpu_wht_group_size;
-    int group_size = turbo3_cpu_wht_group_size;
     if (group_size != 64 && group_size != 128) {
         group_size = (k % 128 == 0) ? 128 : 64;
     }
@@ -376,10 +375,13 @@ size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 /* ---------- TURBO2_0: 2-bit PolarQuant (no QJL) ---------- */
 
 void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_turbo2_0_gs(x, y, k, 0);
+}
+
+void quantize_row_turbo2_0_gs(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k, int group_size) {
+    block_turbo2_0 * GGML_RESTRICT y = (block_turbo2_0 *) vy;
     assert(k % QK_TURBO2 == 0);
 
-    extern int turbo3_cpu_wht_group_size;
-    int group_size = turbo3_cpu_wht_group_size;
     if (group_size != 64 && group_size != 128) {
         group_size = (k % 128 == 0) ? 128 : 64;
     }

@@ -2690,8 +2690,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
             if (cur->ne[0] % turbo_group == 0) {
                 if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
-                ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv() : nullptr;
-                cur = ggml_turbo_wht(ctx0, cur, 1, turbo_group, innerq_scale);  // 1 = inverse
+                cur = ggml_turbo_wht(ctx0, cur, 1, turbo_group);  // 1 = inverse
             }
         }
 
@@ -2768,8 +2767,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
             if (kqv->ne[0] % turbo_group == 0) {
                 if (!ggml_is_contiguous(kqv)) { kqv = ggml_cont(ctx0, kqv); }
-                ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv() : nullptr;
-                kqv = ggml_turbo_wht(ctx0, kqv, 1, turbo_group, innerq_scale);
+                kqv = ggml_turbo_wht(ctx0, kqv, 1, turbo_group);
             }
         }
 
@@ -2965,8 +2963,7 @@ ggml_tensor * llm_graph_context::build_attn(
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
         }
         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
-        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
+        q = ggml_turbo_wht(ctx0, q, 0, 0);  // 0 = forward, 0 = auto group size from q->ne[0]
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
@@ -2981,7 +2978,7 @@ ggml_tensor * llm_graph_context::build_attn(
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
             // Reshape to 4D, extract original head_dim, reshape back to 2D
-            // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
+            // cur shape post-MHA is (n_embd_head * n_head, n_tokens),
             // not (n_embd_head * n_head_kv, n_tokens). The output carries one
             // row per Q head, so derive the head count from the tensor itself:
             // hparams.n_head(il) is correct but is a second source of truth
@@ -3098,8 +3095,7 @@ ggml_tensor * llm_graph_context::build_attn(
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
         }
         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
-        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
+        q = ggml_turbo_wht(ctx0, q, 0, 0);  // 0 = forward, 0 = auto group size
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
@@ -3112,7 +3108,7 @@ ggml_tensor * llm_graph_context::build_attn(
         const int64_t padded_v_head = v->ne[0];     // padded V head_dim in cache
         if (padded_v_head != orig_v_head) {
             // cur is 2D: (padded_v_head * n_head, n_tokens) after build_attn_mha
-            // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
+            // cur shape post-MHA is (n_embd_head * n_head, n_tokens),
             // not (n_embd_head * n_head_kv, n_tokens). The output carries one
             // row per Q head, so derive the head count from the tensor itself:
             // hparams.n_head(il) is correct but is a second source of truth
@@ -3299,8 +3295,7 @@ ggml_tensor * llm_graph_context::build_attn(
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
         }
         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
-        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
+        q = ggml_turbo_wht(ctx0, q, 0, 0);
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
@@ -3312,7 +3307,7 @@ ggml_tensor * llm_graph_context::build_attn(
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
-            // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
+            // cur shape post-MHA is (n_embd_head * n_head, n_tokens),
             // not (n_embd_head * n_head_kv, n_tokens). The output carries one
             // row per Q head, so derive the head count from the tensor itself:
             // hparams.n_head(il) is correct but is a second source of truth

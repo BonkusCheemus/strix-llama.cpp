@@ -17,8 +17,6 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
 template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
-// minBlocksPerSM=1 matches upstream plain f16 decode (poolside board). minBlocks=2 was a
-// turbo-path occupancy nudge that can regress f16/f16 TG on GB10 (~1% decode).
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -96,7 +94,7 @@ static __global__ void flash_attn_ext_vec(
     //
     // That last property is what makes it unaffordable in general: Q_reg below is
     // [ncols][(D/2)/nthreads_KQ], so at nthreads_KQ=1 the per-lane Q working set is the whole
-    // Q vector. Measured spill for turbo K (issue #294): ~4.3 KB/lane at ncols=2 on SM 86,
+    // Q vector. Measured spill for turbo K: ~4.3 KB/lane at ncols=2 on SM 86,
     // 295-786 VGPRs across CDNA/RDNA2/RDNA3/RDNA4, at both hsk=128 and hsk=256.
     //
     // The shared-memory LUT paths below are the exception. They compute the full D-length dot
@@ -174,14 +172,6 @@ static __global__ void flash_attn_ext_vec(
                                     (type_K == GGML_TYPE_TURBO3_0) ? 8 : 4;
     constexpr int lut_stride = n_centroids_lut > 0 ? n_centroids_lut + 1 : 1;
     __shared__ half turbo_lut[n_centroids_lut > 0 ? D : 1][lut_stride];
-
-    // Sparse V: skip V dequant for positions with negligible attention weights.
-    // At long context, most V positions contribute < 1e-6 to the output — skipping
-    // their dequant saves significant compute (especially for quantized V types).
-    constexpr float sparse_v_threshold_f = 1e-6f;
-#ifdef V_DOT2_F32_F16_AVAILABLE
-    const     half  sparse_v_threshold_h = __float2half(sparse_v_threshold_f);
-#endif
 
     float KQ_max[ncols];
     float KQ_sum[ncols];
@@ -405,10 +395,11 @@ static __global__ void flash_attn_ext_vec(
             for (int offset = nthreads_KQ; offset < WARP_SIZE; offset <<= 1) {
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], __shfl_xor_sync(0xFFFFFFFF, KQ_max_new[j], offset, WARP_SIZE));
             }
-            const float KQ_max_scale = __expf(KQ_max[j] - KQ_max_new[j]);
+            // Fast __expf only when a turbo type is involved; f16/q8_0/q4_0 keep expf bit for bit.
+            const float KQ_max_scale = (K_is_turbo || V_is_turbo) ? __expf(KQ_max[j] - KQ_max_new[j]) : expf(KQ_max[j] - KQ_max_new[j]);
             KQ_max[j] = KQ_max_new[j];
 
-            KQ_reg[j] = __expf(KQ_reg[j] - KQ_max[j]);
+            KQ_reg[j] = (K_is_turbo || V_is_turbo) ? __expf(KQ_reg[j] - KQ_max[j]) : expf(KQ_reg[j] - KQ_max[j]);
             KQ_sum[j] = KQ_sum[j]*KQ_max_scale + KQ_reg[j];
             if constexpr (!V_is_turbo) { KQ[j*nthreads + tid] = KQ_reg[j]; }
 
@@ -445,19 +436,6 @@ static __global__ void flash_attn_ext_vec(
                 }
             }
 
-            // Sparse V: skip V dequant if all attention weights for this position are negligible.
-            // Compiled out for unquantized V (f16/bf16/turbo): at short decode depth the
-            // threshold almost never fires, so the branch is pure overhead and regresses
-            // plain f16/f16 TG vs upstream. Keep for quantized V only.
-            if constexpr (!V_is_unquantized) {
-                bool dominated = true;
-#pragma unroll
-                for (int j = 0; j < ncols; ++j) {
-                    if (__hgt(__low2half(KQ_k[j]), sparse_v_threshold_h)) { dominated = false; break; }
-                }
-                if (dominated) { continue; }
-            }
-
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 half2 tmp[V_rows_per_thread/2];
@@ -490,16 +468,6 @@ static __global__ void flash_attn_ext_vec(
                 } else {
                     KQ_k[j] = KQ[j*nthreads + k];
                 }
-            }
-
-            // Sparse V: quantized V only — see half2 path comment above.
-            if constexpr (!V_is_unquantized) {
-                bool dominated = true;
-#pragma unroll
-                for (int j = 0; j < ncols; ++j) {
-                    if (KQ_k[j] >= sparse_v_threshold_f) { dominated = false; break; }
-                }
-                if (dominated) { continue; }
             }
 
             // Turbo V path: precompute scaled centroids once per block to eliminate
@@ -860,7 +828,7 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
 
-// TurboQuant (LLM-739): halo-box has no single-pair extern macro; declare one.
+// TurboQuant: no single-pair extern macro exists here; declare one.
 #define EXTERN_DECL_FATTN_VEC_CASE(D, type_K, type_V) extern DECL_FATTN_VEC_CASE(D, type_K, type_V)
 
 // TurboQuant3 — turbo3 K + turbo3 V (KV cache uses same type)

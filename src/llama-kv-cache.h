@@ -196,8 +196,6 @@ public:
     // otherwise depend on whatever the masked-out cells last held.
     void zero_rows(uint32_t strm, uint32_t r0, uint32_t r1);
     void zero_idxs(uint32_t strm, const std::vector<uint32_t> & idxs);   // ascending cell indices
-    // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
-    ggml_tensor * get_turbo_innerq_scale_inv() const { return turbo_innerq_scale_inv; }
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -328,9 +326,6 @@ private:
 
     std::vector<kv_layer> layers;
 
-    // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization (128 floats)
-    ggml_tensor * turbo_innerq_scale_inv = nullptr;
-
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
@@ -418,9 +413,6 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
-
-    // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
-    ggml_tensor * get_turbo_innerq_scale_inv() const override;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

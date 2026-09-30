@@ -8,6 +8,7 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
+#include "ggml-quants.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
@@ -375,6 +376,16 @@ static void ggml_vec_dot_rocmfpx_fp8_q8_0(int n, float * GGML_RESTRICT s, size_t
 
     *s = sumf;
 }
+// Forward declarations — defined below, after utility functions
+static void ggml_vec_dot_turbo3_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_turbo2_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
@@ -612,6 +623,24 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo3_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo3_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO2_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo2_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo2_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO4_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo4_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo4_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
     },
 };
 
@@ -2285,6 +2314,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_TURBO_WHT:
+            {
+                ggml_compute_forward_turbo_wht(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2481,6 +2514,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_TURBO_WHT:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -3676,6 +3710,76 @@ enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct g
     cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
 
     return ggml_graph_compute(cgraph, &cplan);
+}
+
+// The TurboQuant vec_dot kernels below have no SIMD path yet, so they dequantize
+// to f32 and dot, staged through a fixed-size chunk on the stack: no allocation
+// per call, and both operands stay in L1.
+//
+// Every TurboQuant row dequant is a pure per-block loop with no cross-block
+// state (ggml-turbo-quant.c), so splitting on block boundaries yields identical
+// bytes, and the accumulator is carried across chunks in order.
+#define GGML_TQ_DOT_CHUNK 256
+
+// vy is plain f32 — used by CPU flash attention against a TurboQuant KV cache
+// for head dims the GPU backends do not support (e.g. D=192).
+static void ggml_vec_dot_turbo_f32_impl(enum ggml_type type_x, int n, float * GGML_RESTRICT s,
+                                        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
+    const struct ggml_type_traits * trx = ggml_get_type_traits(type_x);
+
+    const int64_t blk = trx->blck_size;
+    GGML_ASSERT(n % blk == 0);
+    GGML_ASSERT(blk <= GGML_TQ_DOT_CHUNK);
+
+    const int64_t chunk = (GGML_TQ_DOT_CHUNK / blk) * blk;
+
+    const char  * px = (const char  *) vx;
+    const float * y  = (const float *) vy;
+
+    float xb[GGML_TQ_DOT_CHUNK];
+    float sum = 0.0f;
+
+    for (int64_t i = 0; i < n; i += chunk) {
+        const int64_t nc = MIN(chunk, n - i);
+        trx->to_float(px, xb, nc);
+        for (int64_t j = 0; j < nc; j++) {
+            sum += xb[j] * y[i + j];
+        }
+        px += (nc / blk) * trx->type_size;
+    }
+
+    *s = sum;
+}
+
+// TurboQuant3 vec_dot: dequantize turbo3 block to f32, then dot with f32 operand.
+// Used by CPU flash attention for models with D not supported by CUDA FA (e.g. D=192).
+static void ggml_vec_dot_turbo3_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    ggml_vec_dot_turbo_f32_impl(GGML_TYPE_TURBO3_0, n, s, vx, vy);
+}
+
+// TurboQuant2 vec_dot: dequantize turbo2 block to f32, then dot with f32 operand.
+static void ggml_vec_dot_turbo2_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    ggml_vec_dot_turbo_f32_impl(GGML_TYPE_TURBO2_0, n, s, vx, vy);
+}
+
+// TurboQuant4 vec_dot: dequantize turbo4 block to f32, then dot with f32 operand.
+static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    ggml_vec_dot_turbo_f32_impl(GGML_TYPE_TURBO4_0, n, s, vx, vy);
 }
 
 void ggml_cpu_fp32_to_fp32(const float * x, float * y, int64_t n) {

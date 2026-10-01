@@ -35,10 +35,40 @@ static constexpr int WG_HEADS = 2;    // Q heads per block, must divide the GQA 
 static constexpr int WG_QROWS = 32;   // queries per block
 static constexpr int WG_KEYS  = 16;   // keys per tile
 
+// One flag per (32-query block, 16-key tile, mask sequence): 1 if every mask value of the tile is exactly 0.
+// Reading the f16 mask cost 13 of 43.6 ms at kv 45056, nb 512 (OPT-50); in prefill nearly every tile is
+// all-zero, so the main kernel reads one byte instead of 2 KB of scattered mask rows. One wave per tile,
+// lane = query row. Rows past n_tokens count as zero (the main kernel never reads their mask).
+static __global__ void flash_attn_wmma_gqa_zero_tiles(
+        const char * __restrict__ mask, uint8_t * __restrict__ zero_tile,
+        const int n_tokens, const int n_kv, const int64_t nb31, const int64_t nb33) {
+    const int tile = blockIdx.x;
+    const int qb   = blockIdx.y;
+    const int ms   = blockIdx.z;
+    const int t    = qb*WG_QROWS + threadIdx.x;
+    const int key0 = tile*WG_KEYS;
+
+    bool zero = true;
+    if (key0 + WG_KEYS > n_kv) {
+        zero = false;  // partial tail tile: leave it to the per-key path
+    } else if (t < n_tokens) {
+        const half2 * row = (const half2 *) (mask + ms*nb33 + int64_t(t)*nb31) + key0/2;
+#pragma unroll
+        for (int i = 0; i < WG_KEYS/2; ++i) {
+            const float2 m = __half22float2(row[i]);
+            zero = zero && m.x == 0.0f && m.y == 0.0f;
+        }
+    }
+    zero = __all(zero);
+    if (threadIdx.x == 0) {
+        zero_tile[(int64_t(ms)*gridDim.y + qb)*gridDim.x + tile] = zero;
+    }
+}
+
 __launch_bounds__(256, 2)
 static __global__ void flash_attn_wmma_gqa_d256(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
-        const char * __restrict__ mask, float * __restrict__ dst, const float scale,
+        const char * __restrict__ mask, const uint8_t * __restrict__ zero_tile, float * __restrict__ dst, const float scale,
         const int n_tokens, const int n_kv, const int n_head, const int gqa,
         const int64_t nb01, const int64_t nb02, const int64_t nb03,
         const int64_t nb11, const int64_t nb12, const int64_t nb13,
@@ -111,6 +141,8 @@ static __global__ void flash_attn_wmma_gqa_d256(
     const int sm_t   = query_start + rb_offset(sm_rg / 16) + sm_rg % 16;
     const half * mask_row = sm_t < n_tokens ?
         (const half *) (mask + (seq % ne33)*nb33 + int64_t(sm_t)*nb31) : nullptr;
+    const int n_tiles = (n_kv + WG_KEYS - 1) / WG_KEYS;
+    const uint8_t * zero_row = zero_tile + (int64_t(seq % ne33)*gridDim.x + blockIdx.x)*n_tiles;
 
     const char * k_base = K + seq*nb13 + kv_head*nb12;
     const int    v_key   = lane % WG_KEYS;
@@ -179,11 +211,12 @@ static __global__ void flash_attn_wmma_gqa_d256(
             const int row = sm_rg % 16;
             float part_max = -INFINITY;
             float vals[kPerLane];
+            const bool tile_zero = zero_row[key_start / WG_KEYS];
 #pragma unroll
             for (int m = 0; m < kPerLane; ++m) {
                 const int col = sm_seg*kPerLane + m;
                 const int key = key_start + col;
-                const float mv = mask_row && key < n_kv ? __half2float(mask_row[key]) : -INFINITY;
+                const float mv = mask_row && key < n_kv ? (tile_zero ? 0.0f : __half2float(mask_row[key])) : -INFINITY;
                 vals[m] = mv == -INFINITY ? -INFINITY : s_lds[0][rb][row][col] + s_lds[1][rb][row][col] + mv;
                 part_max = fmaxf(part_max, vals[m]);
             }
@@ -370,10 +403,16 @@ void ggml_cuda_flash_attn_ext_wmma_gqa(ggml_backend_cuda_context & ctx, ggml_ten
     }
     GGML_ASSERT(nbK[1] % 16 == 0 && nbK[2] % 16 == 0 && nbV[1] % 16 == 0 && nbV[2] % 16 == 0);
 
-    const dim3 grid((Q->ne[1] + WG_QROWS - 1) / WG_QROWS, Q->ne[2] / WG_HEADS, Q->ne[3]);
+    const int n_qb    = (Q->ne[1] + WG_QROWS - 1) / WG_QROWS;
+    const int n_tiles = (K->ne[1] + WG_KEYS - 1) / WG_KEYS;
+    ggml_cuda_pool_alloc<uint8_t> zero_tile(ctx.pool(), size_t(mask->ne[3]) * n_qb * n_tiles);
+    flash_attn_wmma_gqa_zero_tiles<<<dim3(n_tiles, n_qb, mask->ne[3]), WARP_SIZE, 0, stream>>>(
+        (const char *) mask->data, zero_tile.ptr, Q->ne[1], K->ne[1], mask->nb[1], mask->nb[3]);
+
+    const dim3 grid(n_qb, Q->ne[2] / WG_HEADS, Q->ne[3]);
     const dim3 block(WARP_SIZE, 8, 1);
     flash_attn_wmma_gqa_d256<<<grid, block, 0, stream>>>(
-        (const char *) Q->data, K_data, V_data, (const char *) mask->data, (float *) dst->data, scale,
+        (const char *) Q->data, K_data, V_data, (const char *) mask->data, zero_tile.ptr, (float *) dst->data, scale,
         Q->ne[1], K->ne[1], Q->ne[2], Q->ne[2] / K->ne[2],
         Q->nb[1], Q->nb[2], Q->nb[3], nbK[1], nbK[2], nbK[3], nbV[1], nbV[2], nbV[3],
         mask->nb[1], mask->nb[3], mask->ne[3]);

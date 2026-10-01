@@ -218,6 +218,10 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2, 256, 2, 128,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  3,  96, 2,  32,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  32, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 2,  32, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 384, 1,  32, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 48, 384, 1,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 256, 2,  64, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  32, 128)
@@ -297,6 +301,10 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 8,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  3,  96, 8,  32,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 4,  32, 256) // ncols2=6: all 6 GQA heads of a KV head in one block
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 5,  32, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 384, 3,  32, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 48, 384, 2,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 6,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 6,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 5,  32, 256)
@@ -1304,6 +1312,34 @@ static __global__ void flash_attn_tile(
 fattn_kernel_t ggml_cuda_fattn_tile_d256_ncols32_rdna3_5(const bool use_logit_softcap);
 #endif // GGML_USE_HIP
 
+// Fused turbo K/V tile with all 6 GQA heads of one KV head in a block (ncols2=6): each K/V tile is
+// decoded once per KV head instead of 3 times (ncols2=2). For DSpark verify widths (Q->ne[1] <= 8).
+// GGML_FA_TURBO_TILE_GQA6=1 routes widths 2-8, =2 also width 1 (plain decode).
+static bool ggml_cuda_fattn_tile_turbo_gqa6(const ggml_tensor * dst) {
+#ifdef GGML_USE_HIP
+    static const int mode = [] {
+        const char * e = getenv("GGML_FA_TURBO_TILE_GQA6");
+        return e ? atoi(e) : 0;
+    }();
+    static const bool turbo_fused = [] {
+        const char * e = getenv("GGML_FA_TURBO_TILE_FUSED");
+        return e && atoi(e) != 0;
+    }();
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return mode > 0 && turbo_fused && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
+        Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[2] == 6*K->ne[2] &&
+        (K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0) && V->type == GGML_TYPE_TURBO4_0 &&
+        Q->ne[1] <= 8 && (Q->ne[1] >= 2 || mode >= 2) &&
+        dst->src[3] != nullptr && K->ne[1] % FATTN_KQ_STRIDE == 0;
+#else
+    GGML_UNUSED(dst);
+    return false;
+#endif // GGML_USE_HIP
+}
+
 template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap>
 static void launch_fattn_tile_case(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int nwarps, const int nbatch_fa, const int warp_size) {
@@ -1361,6 +1397,26 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, 3, cc) / warp_size;
         const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, 3, cc);
         launch_fattn_tile_case<DKQ, DV, 1, 3, use_logit_softcap>(ctx, dst, nwarps, nbatch_fa, warp_size);
+        return;
+    } else if constexpr (ncols2 == 6) {
+        // Q->ne[1] <= 8 (ggml_cuda_fattn_tile_turbo_gqa6): one block per KV head, ncols1 >= width.
+        if (Q->ne[1] <= 1) {
+            const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, 6, cc) / warp_size;
+            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, 6, cc);
+            launch_fattn_tile_case<DKQ, DV, 1, 6, use_logit_softcap>(ctx, dst, nwarps, nbatch_fa, warp_size);
+        } else if (Q->ne[1] <= 2) {
+            const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, 12, cc) / warp_size;
+            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, 12, cc);
+            launch_fattn_tile_case<DKQ, DV, 2, 6, use_logit_softcap>(ctx, dst, nwarps, nbatch_fa, warp_size);
+        } else if (Q->ne[1] <= 4) {
+            const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, 24, cc) / warp_size;
+            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, 24, cc);
+            launch_fattn_tile_case<DKQ, DV, 4, 6, use_logit_softcap>(ctx, dst, nwarps, nbatch_fa, warp_size);
+        } else {
+            const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, 48, cc) / warp_size;
+            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, 48, cc);
+            launch_fattn_tile_case<DKQ, DV, 8, 6, use_logit_softcap>(ctx, dst, nwarps, nbatch_fa, warp_size);
+        }
         return;
     } else {
 
@@ -1504,6 +1560,10 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
         if constexpr (DKQ == 256 && DV == 256) {
 #ifdef GGML_USE_HIP
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            if (use_gqa_opt && ggml_cuda_fattn_tile_turbo_gqa6(dst)) {
+                launch_fattn_tile_switch_ncols1<DKQ, DV, 6, use_logit_softcap>(ctx, dst);
+                return;
+            }
             if (use_gqa_opt && Q->ne[1] == 1 && gqa_ratio == 6 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && GGML_CUDA_CC_IS_RDNA3_5(cc)) {
                 launch_fattn_tile_switch_ncols1<DKQ, DV, 3, use_logit_softcap>(ctx, dst);
                 return;

@@ -738,6 +738,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    if (gqa_opt_applies && ggml_cuda_fattn_tile_turbo_gqa6(dst)) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
+
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {

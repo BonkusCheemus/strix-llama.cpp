@@ -285,10 +285,14 @@ static __global__ void flash_attn_wmma_gqa_d256(
 
 bool ggml_cuda_flash_attn_ext_wmma_gqa_supported(const ggml_tensor * dst) {
 #ifdef GGML_USE_HIP
-    static const bool enabled = [] {
+    // GGML_FA_WMMA_GQA = minimum KV length that takes this kernel; 0 = off, 1 = always.
+    // Default 16384: on the 27B (turbo4 K/V, ub 512) it costs ~2% pp512 at 12k depth and
+    // gains 4-6.5% from 20k to 45k (OPT-50 gate, 2026-10-01).
+    static const int64_t min_kv = [] {
         const char * e = getenv("GGML_FA_WMMA_GQA");
-        return e && atoi(e) != 0;
+        return e ? (int64_t) atoll(e) : (int64_t) 16384;
     }();
+    const bool enabled = min_kv > 0 && dst->src[1]->ne[1] >= min_kv;
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];

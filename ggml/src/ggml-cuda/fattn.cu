@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fattn-wmma-gqa.cuh"
 #if defined(GGML_USE_HIP)
 #include "qsa-prefill.cuh"
 #include "qsa-decode.cuh"
@@ -836,6 +837,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
+            // same f16 K/V buffers as MMA (get_alloc_size reserves them for this kernel choice)
+            if (ggml_cuda_flash_attn_ext_wmma_gqa_supported(dst)) {
+                ggml_cuda_flash_attn_ext_wmma_gqa(ctx, dst);
+                break;
+            }
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
     }

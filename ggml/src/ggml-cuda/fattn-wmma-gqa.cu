@@ -5,6 +5,7 @@
 //   * V reaches LDS transposed with one key per lane (conflict-free LDS writes);
 //   * the next K/V tile is loaded into registers while the current tile is used.
 // (Prefetching the mask values the same way was measured slower: 52.7 vs 46.3 ms at kv 45056, nb 512.)
+// (Decoding turbo4 K/V inside the loads instead of converting to f16 first was also slower: 60-61 vs 46 ms.)
 // Changes for ggml: Q/K/V/mask/dst through ggml strides, the KQ mask instead of an implicit causal mask
 // (so multi-sequence and kv-unified batches are correct), scale as a parameter, no gate/LSE outputs.
 // K/V must already be f16 (launch converts quantized K/V like the MMA path does).

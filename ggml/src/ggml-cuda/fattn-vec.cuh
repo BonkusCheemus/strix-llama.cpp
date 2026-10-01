@@ -805,9 +805,12 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         const char * e = getenv("GGML_FA_TURBO_VEC_COLS1");
         return e && atoi(e) != 0;
     }();
-    constexpr bool K_has_lut = type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0;
+    // turbo2/3 K: the shared-memory LUT only exists at one column per block.
+    // turbo4 K: no LUT, but two columns per block double the per-lane Q working set;
+    // two one-column blocks are cheaper at width 2 (measured with the 32k decode perf cases).
+    constexpr bool K_cols1 = type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0;
 
-    if (Q->ne[1] == 1 || (K_has_lut && D <= 256 && turbo_cols1)) {
+    if (Q->ne[1] == 1 || (K_cols1 && D <= 256 && turbo_cols1)) {
         constexpr int cols_per_block = 1;
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;

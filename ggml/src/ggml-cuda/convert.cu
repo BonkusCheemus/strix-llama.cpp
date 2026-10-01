@@ -247,39 +247,16 @@ static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_
 
 template<typename dst_t>
 static __global__ void dequantize_block_rocmfp4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
 
-    const int64_t i   = blockIdx.x;
-    const block_rocmfp4 * x = (const block_rocmfp4 *) vx + i*(QK_K/QK_ROCMFP4);
-
-    const int64_t tid = threadIdx.x;
-    const int64_t il = tid/8; // 0...3
-    const int64_t ib = tid%8; // 0...7
-    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
-    const uint8_t * q4 = x[ib].qs + 4*il;
-    const float d0 = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e[0]);
-    const float d1 = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e[1]);
-    for (int j = 0; j < 4; ++j) {
-        y[j+ 0] = d0 * rocmfp4_decode_i8(q4[j]);
-        y[j+16] = d1 * rocmfp4_decode_i8(q4[j] >>  4);
-    }
+    dequantize_rocmfp4(vx, i, yy + i*QK_K, threadIdx.x);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_rocmfp4_fast(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-
     const int64_t i = blockIdx.x;
-    const block_rocmfp4_fast * x = (const block_rocmfp4_fast *) vx + i*(QK_K/QK_ROCMFP4);
 
-    const int64_t tid = threadIdx.x;
-    const int64_t il = tid/8; // 0...3
-    const int64_t ib = tid%8; // 0...7
-    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
-    const uint8_t * q4 = x[ib].qs + 4*il;
-    const float d = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e);
-    for (int j = 0; j < 4; ++j) {
-        y[j+ 0] = d * rocmfp4_decode_i8(q4[j]);
-        y[j+16] = d * rocmfp4_decode_i8(q4[j] >>  4);
-    }
+    dequantize_rocmfp4_fast(vx, i, yy + i*QK_K, threadIdx.x);
 }
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
@@ -458,13 +435,13 @@ static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t 
 }
 
 template<typename dst_t>
-static void dequantize_row_rocmfp4_hip(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+static void dequantize_row_rocmfp4_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
     dequantize_block_rocmfp4<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
-static void dequantize_row_rocmfp4_fast_hip(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+static void dequantize_row_rocmfp4_fast_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
     dequantize_block_rocmfp4_fast<<<nb, 32, 0, stream>>>(vx, y);
 }
@@ -534,6 +511,29 @@ static __global__ void convert_unary(
     }
 }
 
+template <typename T> struct alignas(sizeof(T)*4) cvt_vec4 { T v[4]; };
+
+// four elements per thread, so a warp moves 512B (RDNA) / 1k (CDNA) per load
+template <typename src_t, typename dst_t>
+static __global__ void convert_unary_cont_vec4(
+        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k4) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k4) {
+        return;
+    }
+
+    const cvt_vec4<src_t> xv = ((const cvt_vec4<src_t> *) vx)[i];
+
+    cvt_vec4<dst_t> yv;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        yv.v[j] = ggml_cuda_cast<dst_t>(xv.v[j]);
+    }
+
+    ((cvt_vec4<dst_t> *) y)[i] = yv;
+}
+
 template <typename src_t, typename dst_t>
 static void convert_unary_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -566,6 +566,15 @@ static __global__ void convert_f16_f32_cont(const half * x, float * y, int64_t k
 
 template <typename src_t, typename dst_t>
 static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    if (k % 4 == 0 &&
+        (uintptr_t) vx % alignof(cvt_vec4<src_t>) == 0 &&
+        (uintptr_t) y  % alignof(cvt_vec4<dst_t>) == 0) {
+        const int64_t k4 = k/4;
+        const int64_t num_blocks = (k4 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+        convert_unary_cont_vec4<src_t, dst_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k4);
+        return;
+    }
+
     const int nblocks = (k + 2*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (2*CUDA_DEQUANTIZE_BLOCK_SIZE);
     if constexpr (std::is_same<src_t, float>::value && std::is_same<dst_t, half>::value) {
         if ((uintptr_t) vx % alignof(float2) == 0 && (uintptr_t) y % alignof(half2) == 0) {
@@ -629,9 +638,9 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_Q4_0_ROCMFP4:
-            return dequantize_row_rocmfp4_hip;
+            return dequantize_row_rocmfp4_cuda;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-            return dequantize_row_rocmfp4_fast_hip;
+            return dequantize_row_rocmfp4_fast_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
         case GGML_TYPE_F32:
@@ -693,9 +702,9 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_Q4_0_ROCMFP4:
-            return dequantize_row_rocmfp4_hip;
+            return dequantize_row_rocmfp4_cuda;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-            return dequantize_row_rocmfp4_fast_hip;
+            return dequantize_row_rocmfp4_fast_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
         case GGML_TYPE_TURBO3_0:
@@ -764,9 +773,9 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_Q4_0_ROCMFP4:
-            return dequantize_row_rocmfp4_hip;
+            return dequantize_row_rocmfp4_cuda;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-            return dequantize_row_rocmfp4_fast_hip;
+            return dequantize_row_rocmfp4_fast_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
         case GGML_TYPE_TURBO3_0:

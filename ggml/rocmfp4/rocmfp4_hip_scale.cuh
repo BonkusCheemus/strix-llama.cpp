@@ -1,3 +1,11 @@
+// ROCmFPx quant formats, hand-ported into this fork.
+//
+// Origin:      https://github.com/charlie12345/ROCmFPX - creator of the ROCmFP4 format.
+// Ported from: https://github.com/ciru-ai/ROCmFPX - a fork of the above.
+//
+// Both upstream projects are MIT licensed and based on llama.cpp; upstream authors
+// retain their authorship and MIT license credit. See LICENSE.
+
 #pragma once
 
 #include <cstdint>
@@ -89,12 +97,15 @@ static __device__ __forceinline__ float rocmfp4_u32_as_f32(uint32_t bits) {
 #endif
 }
 
-// ROCmFP4 validates scale bytes before backend execution, so HIP/ROCm hot
-// paths can decode finite unsigned E4M3 half-scales directly without the
-// generic FP8 NaN handling used by other formats.
+// Decode invalid scale bytes (> 0x7e) as 0, matching the CPU decoder in
+// rocmfp4.c. Loader validation of these bytes only runs with --check-tensors,
+// so kernels must not trust them.
 static __device__ __forceinline__ float rocmfp4_ue4m3_to_fp32_half_finite(uint8_t x) {
+    if (x > 0x7e) {
+        return 0.0f;
+    }
 #if defined(GGML_USE_HIP) && GGML_ROCMFP4_USE_SCALE_LUT
-    return x <= 0x7e ? rocmfp4_scale_ue4m3_half_lut[x] : 0.0f;
+    return rocmfp4_scale_ue4m3_half_lut[x];
 #else
     const int exp = (x >> 3) & 0xF;
     const int man = x & 0x7;

@@ -134,6 +134,8 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+
+    void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
@@ -176,6 +178,9 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // s_copy(i) == head + i for all i < n_seqs, without side effects; always false with n_rs_seq > 0
+    bool is_s_copy_main_identity(uint32_t n_seqs) const;
 
 private:
     const llama_memory_status status;

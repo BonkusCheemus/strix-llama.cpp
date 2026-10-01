@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_model;
 
 // available models
 enum llm_type {
@@ -613,6 +614,31 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+// MTP draft vocabulary subset (llama_context_params::mtp_draft_vocab): the rows of the LM head for token ids < n_keep
+// plus control and user-defined tokens. Immutable once built. Contexts that request the same n_keep share one.
+struct llama_mtp_draft_vocab {
+    int32_t n_keep = 0;
+
+    ggml_tensor * head = nullptr; // [n_embd, n_rows], same type as the LM head
+    ggml_tensor * ids  = nullptr; // [n_rows] I64, token id of each row
+
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf;
+};
+
+struct llama_prec_policy {
+    // the key is the weight tensor `res->src[0]`, stores the recommended accumulation type of the op (unused for now)
+    // TODO: migrate ad-hoc ggml_prec_set_acc() calls to this container + update apply() to use it
+    std::unordered_map<const ggml_tensor *, ggml_prec> prec_acc;
+
+    // the key is the weight tensor `res->src[0]`, stores the recommended activation precision type
+    std::unordered_map<const ggml_tensor *, ggml_prec> prec_src1;
+
+    bool apply(ggml_tensor * res) const;
+
+    void load(llama_model_loader & ml, const llama_model & model);
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -621,6 +647,9 @@ struct llama_model {
 
     llama_hparams hparams = {};
     llama_vocab   vocab;
+
+    // per-tensor activation precision policy
+    llama_prec_policy prec_policy;
 
     // for classifier models
     std::vector<std::string> classifier_labels;
@@ -646,6 +675,9 @@ struct llama_model {
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
+
+    // hrm-text initial low-cycle state
+    struct ggml_tensor * hrm_z_l_init = nullptr;
 
     // DeepSeek-V4
     struct ggml_tensor * hc_head_fn    = nullptr;
@@ -753,6 +785,10 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
+    // draft vocabulary subset for mtp_draft_vocab = n_keep, built on first request and freed with the last context
+    // holding it; nullptr if the subset cannot be used with this model (thread-safe)
+    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft_vocab_get(int32_t n_keep) const;
+
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 
@@ -814,6 +850,9 @@ struct llama_model_base : public llama_model {
     void create_tensor_qkv(llama_layer & layer, int bid,
                 int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
                 int flags);
+
+    // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
+    void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
 
     void load_stats  (llama_model_loader & ml) override;
     void load_hparams(llama_model_loader & ml) override;

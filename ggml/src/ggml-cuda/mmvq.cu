@@ -53,6 +53,8 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q4_0_ROCMFP4:      return vec_dot_rocmfp4_q8_1;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST: return vec_dot_rocmfp4_fast_q8_1;
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
+        case GGML_TYPE_Q4_0_ROCMFP4:      return vec_dot_q4_0_rocmfp4_q8_1;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST: return vec_dot_q4_0_rocmfp4_fast_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
@@ -84,6 +86,8 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q4_0_ROCMFP4:      return VDR_ROCMFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST: return VDR_ROCMFP4_FAST_Q8_1_MMVQ;
         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
+        case GGML_TYPE_Q4_0_ROCMFP4:      return VDR_ROCMFP4_Q8_1_MMVQ;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST: return VDR_ROCMFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
         case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
@@ -582,6 +586,22 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_
                 //     ne11 = 8 by 8.7 %, 8.9 % and 10.5 % on average. IQ2_XS (12.7) and IQ2_XXS
                 //     (9.9) were re-measured and keep 8. IQ2_S was too: crossover 12.4. Q1_0 and
                 //     Q2_0 are the only two types in this function never measured on gfx1151.
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_VOLTA) {
+        switch (type) {
+            case GGML_TYPE_Q2_K:
+                return ne11 <= 4;
+            case GGML_TYPE_Q3_K:
+                return ne11 <= 6;
+            case GGML_TYPE_Q4_K:
+                return ne11 <= 5;
+            case GGML_TYPE_Q5_K:
+                return ne11 <= 6;
+            case GGML_TYPE_Q6_K:
+                return ne11 <= 7;
+            default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }

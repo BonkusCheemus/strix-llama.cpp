@@ -439,6 +439,14 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 
 #define VDR_ROCMFP4_Q8_1_MMVQ 2
 
+// OURS, and the one define here that is NOT a redefinition. Upstream defines
+// VDR_ROCMFP4_FAST_Q8_1_MMQ and VDR_ROCMFP4_Q8_1_MMVQ but has no ..._FAST_Q8_1_MMVQ,
+// and mmvq.cu:85 uses it. Deleting the whole 495-498 block removed the only
+// definition and broke the build with: use of undeclared identifier
+// VDR_ROCMFP4_FAST_Q8_1_MMVQ. Verified: a define is a redefinition only if the other
+// side defines the same NAME. The other three were - this one was not.
+#define VDR_ROCMFP4_FAST_Q8_1_MMVQ 2
+
 // Dual UE4M3 half-block scales: low nibbles of qs[j] are weights j (scale e[0]),
 // high nibbles are weights j + 16 (scale e[1]). Two int-dot accumulators, matching
 // the q8_1 slot pairing used by vec_dot_mxfp4_q8_1 above.
@@ -492,10 +500,6 @@ static __device__ __forceinline__ float vec_dot_q4_0_rocmfp4_fast_q8_1(
 
 #include "../../rocmfp4/rocmfp4_hip_codebook.cuh"
 
-#define VDR_ROCMFP4_Q8_1_MMVQ 4
-#define VDR_ROCMFP4_Q8_1_MMQ  8
-#define VDR_ROCMFP4_FAST_Q8_1_MMVQ 2
-#define VDR_ROCMFP4_FAST_Q8_1_MMQ  8
 
 static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
                                         const void * __restrict__ vbq,

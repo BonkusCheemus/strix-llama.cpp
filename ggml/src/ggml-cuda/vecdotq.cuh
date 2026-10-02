@@ -94,6 +94,26 @@ static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, con
 #endif
 }
 
+// Upstream's unpack_ksigns, verbatim from 0f36c46b9 vecdotq.cuh:97.
+//
+// DO NOT MERGE THESE TWO FUNCTIONS. They are NOT the same and the names are one
+// character apart. Upstream's returns the sign byte BROADCAST over the word, because
+// its callers select with __vcmpne4(sign & 0x08040201, 0) and need the mask in every
+// byte. Ours returns the byte un-broadcast and the caller spreads it with apply_signs4.
+// Upstream's mmq-load-tiles.cuh was written against the broadcasting one, and the two
+// now live in the same tree because the mmq family is upstream's while the turbo
+// FA vec/tile kernels are ours. Renaming either one to the other compiles and
+// computes wrong signs - a green build with a wrong answer. Keep both.
+static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
+    // v is a 7 bit int, with the 8th sign being encodable as popcnt
+    // with xor we can "correct" the bit instead of having to mask
+    const uint32_t p = __popc(v) & 1;
+    const uint32_t s = v ^ p << 7;
+    // broadcast over uint to allow for 0x08040201 / 0x80402010 as selectors
+    return s * 0x01010101;
+}
+
+// OURS, unchanged, still what the MMVQ / turbo vec sign path calls.
 // v is a 7 bit int, with the 8th sign being encodable as popcnt
 // with xor we can "correct" the bit instead of having to mask.
 // Returns the 8 sign bits as a byte (bit i = sign of element i); callers hand the two

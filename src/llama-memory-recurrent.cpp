@@ -66,7 +66,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                 // r and s per layer, the separate PLE conv row where the model has one, plus
                 // ingr_l + s_ckpt_l under gdn_replay. Take the widest of the two counts: the
                 // replay path and the PLE path are independent, so max(), not either-or.
-                /*.mem_size   =*/ size_t(std::max(tensors_per_layer, hparams.ple_conv_state() > 0 ? 3u : 2u))*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(std::max(tensors_per_layer, hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };

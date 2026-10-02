@@ -86,8 +86,6 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q4_0_ROCMFP4:      return VDR_ROCMFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST: return VDR_ROCMFP4_FAST_Q8_1_MMVQ;
         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
-        case GGML_TYPE_Q4_0_ROCMFP4:      return VDR_ROCMFP4_Q8_1_MMVQ;
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST: return VDR_ROCMFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
         case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;

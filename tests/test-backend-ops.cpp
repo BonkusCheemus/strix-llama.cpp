@@ -5386,7 +5386,7 @@ struct test_gdn_conv_prefill : public test_case {
         ggml_set_name(beta, "beta");
         ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 128, n_v_heads, 1);
         ggml_set_name(state, "state");
-        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, /*K=*/1, /*emit_mode=*/0);
     }
 };
 

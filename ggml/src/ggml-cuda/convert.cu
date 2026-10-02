@@ -815,10 +815,6 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
-        case GGML_TYPE_Q4_0_ROCMFP4:
-            return dequantize_block_cuda<QK_ROCMFP4, QR_ROCMFP4, dequantize_rocmfp4>;
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-            return dequantize_block_cuda<QK_ROCMFP4, QR_ROCMFP4, dequantize_rocmfp4_fast>;
         case GGML_TYPE_TURBO3_0:
             return dequantize_block_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
         case GGML_TYPE_TURBO2_0:
@@ -854,10 +850,6 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
-        case GGML_TYPE_Q4_0_ROCMFP4:
-            return dequantize_block_cuda<QK_ROCMFP4, QR_ROCMFP4, dequantize_rocmfp4>;
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-            return dequantize_block_cuda<QK_ROCMFP4, QR_ROCMFP4, dequantize_rocmfp4_fast>;
         case GGML_TYPE_F16:
             return convert_unary_cuda<half, nv_bfloat16>;
         default:
@@ -883,10 +875,6 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
-        case GGML_TYPE_Q4_0_ROCMFP4:
-            return dequantize_block_cuda<QK_ROCMFP4, QR_ROCMFP4, dequantize_rocmfp4>;
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-            return dequantize_block_cuda<QK_ROCMFP4, QR_ROCMFP4, dequantize_rocmfp4_fast>;
         case GGML_TYPE_TURBO3_0:
             return dequantize_block_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
         case GGML_TYPE_TURBO2_0:

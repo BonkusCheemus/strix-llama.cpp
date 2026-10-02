@@ -636,7 +636,25 @@ static test_status test_rollback(const common_params & params, llama_model * mod
     ckpt.update_tgt(ctx_src.get(), 0, 0);
     ckpt.load_tgt(ctx_dst.get(), 0, 0);
 
-    constexpr float nmse_eps = 0.0;
+    // TOLERANCE, OUR FORK (Kurumi ruling 2026-10-03 06:31): 1e-10, not upstream's 0.0.
+    //
+    // Upstream ships 0.0 here, i.e. bit-exact. We do not, and the reason is structural rather
+    // than a defect: gdn_replay reconstructs state with ONE batched multi-token call, whereas
+    // the snapshot path takes a precomputed row. A batched reduction and a token-by-token chain
+    // sum in a different order, so the replayed logits agree to floating-point reassociation
+    // error and no further. This is the same class as llama.cpp's existing ubatch-size
+    // nondeterminism, not a state divergence.
+    //
+    // MEASURED on this tree, gfx1151, iron GGUF: nmse = 8.71517e-15, first divergence at
+    // position 6. That is 11 orders of magnitude below the 1e-4 bar the other two sections of
+    // THIS SAME FILE already use (lines 217 and its neighbours), and 4 orders below the 1e-10
+    // set here, so the real error has headroom rather than sitting on the threshold.
+    //
+    // The fork detail that matters for reproducing this: gated_delta_net_cuda is launched with
+    // our gdn_num_warps bound, not upstream's hardcoded 4. Substituting upstream's 4 does not
+    // merely change the error, it makes this test ABORT (SIGABRT) on this GPU. Verified by
+    // experiment, not assumed.
+    constexpr float nmse_eps = 1e-10;
     std::vector<std::vector<float>> logits_src_replay(n_rollback);
     const auto replay_and_compare = [&](const char * mode) {
         for (uint32_t i = 0; i < n_rollback; ++i) {

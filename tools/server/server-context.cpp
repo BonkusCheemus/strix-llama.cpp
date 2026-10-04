@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <iomanip>
 #include <limits>
@@ -31,6 +32,28 @@
 #include <sstream>
 #include <utility>
 #include <fstream>
+
+// [OPT57_SPEC_CKPT_DEVICE] Every LLAMA_STATE_SEQ_FLAGS_ON_DEVICE use in the server is on the
+// speculative checkpoint, never on the prompt checkpoint (create_checkpoint uses
+// LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY alone). Under speculative decoding the draft context is
+// NOT bounded-partial (llama_n_rs_seq(ctx_dft) == 0, so common_context_can_seq_rm does not
+// return RS), which makes the draft-side device save unconditional on every drafted step -- and
+// with gdn_replay the state being saved is the 4-tensor-per-layer replay layout, which is where
+// the served GPU page fault lands (Memory access fault by GPU node-1, 1 of 3 arms at 30k).
+//
+// This helper makes exactly that one condition switchable, with the DEFAULT UNCHANGED: the
+// device save still happens unless you ask for it not to. Set LLAMA_SPEC_CKPT_NO_DEVICE=1 to
+// save the speculative checkpoint to host memory instead, which is the experiment that decides
+// whether the device save is necessary (fault clears => it is, and the fix is to stop doing it
+// there) or merely incidental (fault persists => replay itself produces the bad state).
+//
+// Read once, lazily, so the value cannot change under a running server. Host fallback is the
+// safe direction: it is the documented alternative path in llama.h, not a new behaviour.
+static uint32_t spec_ckpt_state_flags() {
+    static const bool no_device = getenv("LLAMA_SPEC_CKPT_NO_DEVICE") != nullptr;
+    return LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+           (no_device ? 0u : (uint32_t) LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+}
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -3490,7 +3513,7 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, spec_ckpt_state_flags());
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -3529,7 +3552,7 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                    ckpt.load_dft(ctx_dft, slot.id, spec_ckpt_state_flags());
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
@@ -3548,7 +3571,7 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                    ckpt.update_tgt(ctx_tgt, slot.id, spec_ckpt_state_flags());
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3560,7 +3583,7 @@ private:
                 }
 
                 if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                    ckpt.update_dft(ctx_dft, slot.id, spec_ckpt_state_flags());
                 }
             }
         });
@@ -4440,10 +4463,10 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                        ckpt.load_tgt(slot.ctx_tgt, slot.id, spec_ckpt_state_flags());
 
                         if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                            ckpt.load_dft(slot.ctx_dft, slot.id, spec_ckpt_state_flags());
                         }
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);

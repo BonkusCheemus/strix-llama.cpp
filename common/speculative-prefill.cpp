@@ -225,6 +225,23 @@ common_speculative_prefill_result common_speculative_prefill_execute(
         return res;
     }
 
+    if ((int32_t) prompt.size() < params.min_prompt) {
+        // Size gate, the other direction from the floor above. The filter is
+        // lossy by construction, and its damage is worst on SMALL prompts: the
+        // same 30% retention that saves 47 s on a 16k prefill took a 1.4k-token
+        // agent task from 5.1 to 10.5 minutes unfinished (2026-09-19), because
+        // the discarded share of a small prompt IS the payload. Below min_prompt
+        // keep everything: the saving is small there anyway, and correctness is
+        // not negotiable. min_prompt = 0 keeps the old behaviour exactly.
+        SPF_INF("prompt size (%d) is below spec-prefill min-prompt (%d); skipping speculative prefill\n",
+                (int32_t) prompt.size(), params.min_prompt);
+        res.kept_indices.resize(prompt.size());
+        std::iota(res.kept_indices.begin(), res.kept_indices.end(), 0);
+        res.n_prompt_kept = (int32_t) res.kept_indices.size();
+        res.importance_scores.assign(prompt.size(), 1.0f);
+        return res;
+    }
+
     const auto t_start = ggml_time_us();
 
     const llama_model * model_dft = llama_get_model(ctx_dft);

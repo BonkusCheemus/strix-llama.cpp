@@ -3792,6 +3792,15 @@ struct vk_fa_tuning_params {
     }
 };
 
+static bool ggml_vk_fa_enable_shmem_staging(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows,
+                                            ggml_type k_type, ggml_type v_type) {
+    const bool nvidia_default = device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256;
+    const bool amd_small_batch = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN &&
+                                 n_rows > 1 && n_rows <= 8 && hsk <= 256 && hsv <= 256 &&
+                                 k_type == GGML_TYPE_TURBO3_0 && v_type == GGML_TYPE_TURBO4_0;
+    return nvidia_default || amd_small_batch;
+}
+
 static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type);
 static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16, ggml_type v_type = GGML_TYPE_F16);
 
@@ -3845,7 +3854,7 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
 
-    result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
+    result.shmem_staging = ggml_vk_fa_enable_shmem_staging(device, hsk, hsv, n_rows, k_type, v_type);
 
     if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
         result.block_rows /= 2;
@@ -3896,7 +3905,7 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
 
-    result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
+    result.shmem_staging = ggml_vk_fa_enable_shmem_staging(device, hsk, hsv, n_rows, k_type, v_type);
 
     return result;
 }

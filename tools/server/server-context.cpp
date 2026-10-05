@@ -1075,27 +1075,67 @@ private:
 
         llama_memory_seq_rm(llama_get_memory(ctx_spf), slot.id, -1, -1);
 
-        if (res.kept_indices.empty() || (int32_t) res.kept_indices.size() >= (int32_t) prompt.size()) {
+        // Tool-span guard: force-keep every prompt token inside a TOOL-role
+        // message span. Tool results carry file reads and command output; the
+        // estimator scores them low because they are not predictive of the next
+        // token, but dropping them removes ground truth the model needs turns
+        // later (2026-09-19: crossings collapsed the prefix cache, 672 s vs 30 s).
+        // Spans are token offsets into this exact prompt; prompts without spans
+        // (plain completions) are unaffected.
+        std::vector<int32_t> kept_idx(res.kept_indices.begin(), res.kept_indices.end());
+        int32_t n_protected = 0;
+        if (params_base.speculative.prefill.protect_tool && slot.task) {
+            std::vector<char> keep(prompt.size(), 0);
+            for (const int32_t idx : kept_idx) {
+                if (idx >= 0 && idx < (int32_t) prompt.size()) {
+                    keep[idx] = 1;
+                }
+            }
+            for (const auto & span : slot.task->params.message_spans.spans) {
+                if (span.role != COMMON_CHAT_ROLE_TOOL) {
+                    continue;
+                }
+                for (size_t k = span.pos; k < span.pos + span.len && k < keep.size(); ++k) {
+                    if (!keep[k]) {
+                        keep[k] = 1;
+                        ++n_protected;
+                    }
+                }
+            }
+            kept_idx.clear();
+            for (int32_t i = 0; i < (int32_t) keep.size(); ++i) {
+                if (keep[i]) {
+                    kept_idx.push_back(i);
+                }
+            }
+        }
+
+        if (kept_idx.empty() || (int32_t) kept_idx.size() >= (int32_t) prompt.size()) {
+            const char * why = (int32_t) prompt.size() < params_base.speculative.prefill.min_prompt
+                ? "skip-size" : "skip-keptall";
+            SLT_INF(slot, "spec_prefill: %s (kept %d / %d, protected %d)\n",
+                    why, (int) kept_idx.size(), (int) prompt.size(), n_protected);
             return;
         }
 
         llama_tokens kept;
-        kept.reserve(res.kept_indices.size());
-        for (const int32_t idx : res.kept_indices) {
+        kept.reserve(kept_idx.size());
+        for (const int32_t idx : kept_idx) {
             if (idx >= 0 && idx < (int32_t) prompt.size()) {
                 kept.push_back(prompt[idx]);
             }
         }
         if (kept.size() < 2) {
+            SLT_INF(slot, "spec_prefill: skip (kept %d / %d, protected %d, below minimum)\n",
+                    (int) kept.size(), (int) prompt.size(), n_protected);
             return;
         }
 
         slot.spec_prefill_tokens = server_tokens(kept, slot.task->tokens.has_mtmd);
         slot.spec_prefill_active = true;
 
-        SLT_INF(slot, "speculative prefill kept %d / %d tokens (%.1f%%)\n",
-                (int) kept.size(), (int) prompt.size(),
-                100.0f * (float) kept.size() / (float) prompt.size());
+        SLT_INF(slot, "spec_prefill: fired (kept %d / %d, protected %d)\n",
+                (int) kept.size(), (int) prompt.size(), n_protected);
     }
 
     // load the model and initialize llama_context

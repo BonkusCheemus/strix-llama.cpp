@@ -401,6 +401,8 @@ struct common_params_speculative_prefill {
     int32_t             pool_kernel_size = 13;    // 1D average pooling kernel size for smoothing
     bool                keep_bos         = true;  // preserve first token (BOS)
     bool                keep_last        = true;  // preserve last token / tail chunk
+    int32_t             min_prompt       = 0;     // skip the filter when the prompt is smaller than this (0 = always filter)
+    bool                protect_tool     = true;  // force-keep tokens inside TOOL-role message spans (tool results carry file reads; dropping them fails turns later)
 };
 
 struct common_params_speculative {

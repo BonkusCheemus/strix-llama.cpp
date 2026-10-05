@@ -4481,6 +4481,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_PREFILL_P"));
     add_opt(common_arg(
+        {"--spec-prefill-min-prompt"}, "N",
+        string_format("skip speculative prefill when the prompt has fewer than N tokens (default: %d, 0 = filter every prompt). "
+                      "The filter is lossy by construction and its damage is worst on SMALL prompts, where the discarded share is "
+                      "a larger fraction of what the model needs; measured 2026-09-19: p=0.30 on a 1.4k-token agent prompt took a "
+                      "4-test Rust port from 5.1 to 10.5 minutes unfinished, while the same p made a 16k prefill 3.0x faster. "
+                      "Below this size the whole prompt is kept and only the prefill saving is lost.",
+                      params.speculative.prefill.min_prompt),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("spec-prefill min prompt must be >= 0");
+            }
+            params.speculative.prefill.min_prompt = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_PREFILL_MIN_PROMPT"));
+    add_opt(common_arg(
+        {"--spec-prefill-protect-tool"},
+        {"--no-spec-prefill-protect-tool"},
+        string_format("force-keep prompt tokens inside TOOL-role message spans (default: %s). "
+                      "Tool results carry file reads and command output: the filter's estimator scores them low because they "
+                      "are not predictive of the next token, but dropping them removes ground truth the model needs turns later. "
+                      "Measured 2026-09-19: p=0.30 crossings rewrote the prompt, collapsed the prefix cache (672 s prefill vs 30 s), "
+                      "and drove turns 11 -> 26. Spans come from the chat template; prompts without spans are unaffected.",
+                      params.speculative.prefill.protect_tool ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.prefill.protect_tool = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_PREFILL_PROTECT_TOOL"));
+    add_opt(common_arg(
         {"--spec-prefill-chunk", "--spec-prefill-chunk-size"}, "N",
         string_format("chunk grouping size for speculative prefill (default: %d, 0 to disable)", params.speculative.prefill.chunk_size),
         [](common_params & params, int value) {

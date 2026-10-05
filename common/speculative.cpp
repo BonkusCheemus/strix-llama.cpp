@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "speculative-bucket.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
@@ -159,81 +160,56 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
-    // Adaptive draft length.
+    // Adaptive draft length: credit-bucket controller (speculative-bucket.h).
     //
     // Drafting more tokens than the target will accept is pure waste: the draft
     // pays for every token it proposes, and the target verifies all of them, but
     // everything after the first rejection is discarded. A fixed n_max therefore
     // overshoots on unpredictable content (prose) and undershoots on predictable
-    // content (JSON, verbatim quoting) -- which is exactly why MTP measures worse
-    // at n=7 than at n=3 on every content class while DFlash2 prefers 7.
+    // content (JSON, verbatim quoting).
     //
-    // Track an EMA of how many tokens the target actually accepted per draft and
-    // size the next draft just above it. Sizing to ema+1 keeps one token of
-    // headroom so the estimate can climb again when content becomes predictable.
-    // The action censors the measurement: if every drafted token is accepted we
-    // only learn the true acceptance was *at least* n_drafted, never how much
-    // further it would have gone. Averaging a censored sample would ratchet the
-    // draft length down and strand it there. So the two outcomes are treated as
-    // different observations:
-    //   partial accept -> uncensored, we saw the exact stopping point: track it
-    //   full accept    -> censored, a lower bound only: probe upward instead
-    // Backing off is averaged (gentle), probing is additive (faster), so the
-    // controller recovers quickly when content turns predictable again.
-    std::vector<float>   acc_ema;      // per-seq EMA of accepted tokens per draft
-    std::vector<int32_t> n_last_draft; // per-seq size of the draft just issued
-    bool adaptive_n = false;           // enabled by --spec-draft-adaptive
+    // Each sequence tracks a draft depth (n_cur) plus a surplus bucket. Full
+    // accepts fill the bucket; partial accepts drain it. Depth climbs/drops one
+    // step at the bucket cap/floor with the remainder carried over, so one
+    // lucky or unlucky round cannot swing the depth by more than one.
+    std::vector<common_spec_bucket> buckets; // per-seq bucket state
+    bool adaptive_n = false;                 // enabled by --spec-draft-adaptive
 
-    static constexpr float acc_ema_alpha  = 0.25f; // ~4-step memory
-    static constexpr float acc_ema_probe  = 1.0f;  // additive growth on a clean draft
-    static constexpr float acc_ema_init   = 2.0f;
+    static constexpr int32_t bucket_floor = common_spec_bucket::floor_default;
 
     void update_acc_ema(llama_seq_id seq_id, uint16_t n_accepted) {
-        if (seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
+        if (seq_id < 0 || (size_t) seq_id >= buckets.size()) {
             return;
         }
-        const int32_t n_drafted = n_last_draft[seq_id];
-        if (n_drafted > 0 && (int32_t) n_accepted >= n_drafted) {
-            acc_ema[seq_id] += acc_ema_probe;   // censored: lower bound, probe up
-        } else {
-            acc_ema[seq_id] = (1.0f - acc_ema_alpha) * acc_ema[seq_id] + acc_ema_alpha * (float) n_accepted;
-        }
-        n_last_draft[seq_id] = 0;
+        // Called on impl_last only (see common_speculative_accept), so each
+        // impl's buckets see just its own rounds: DSpark buckets eat DSpark
+        // verify results, never ngram-mod rounds.
+        buckets[seq_id].update((int32_t) n_accepted);
     }
 
     // reset on a new prompt / reused server slot; never mid-generation, since
-    // tracking content drift within a response is the point of the EMA
+    // tracking content drift within a response is the point of the controller
     void reset_acc_ema(llama_seq_id seq_id) {
-        if (seq_id >= 0 && (size_t) seq_id < acc_ema.size()) {
-            acc_ema[seq_id]      = acc_ema_init;
-            n_last_draft[seq_id] = 0;
-        }
-    }
-
-    // record the width a sequence was actually drafted at, when the caller had to
-    // override the per-sequence choice (see the DFlash/DSpark batch below)
-    void set_last_draft(llama_seq_id seq_id, int32_t n) {
-        if (seq_id >= 0 && (size_t) seq_id < n_last_draft.size()) {
-            n_last_draft[seq_id] = n;
+        if (seq_id >= 0 && (size_t) seq_id < buckets.size()) {
+            buckets[seq_id].reset(this->n_max, bucket_floor);
         }
     }
 
     // effective draft length for this step, never above the configured n_max
     int32_t adaptive_n_draft(llama_seq_id seq_id, int32_t n_cfg, int32_t n_min) {
-        if (!adaptive_n || seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
+        if (!adaptive_n || seq_id < 0 || (size_t) seq_id >= buckets.size()) {
             return n_cfg;
         }
-        const int32_t n_want = (int32_t) std::lround(acc_ema[seq_id]);
-        const int32_t n      = std::max(std::max(1, n_min), std::min(n_cfg, n_want));
-        acc_ema[seq_id]      = std::min(acc_ema[seq_id], (float) n_cfg); // do not let the probe run away
-        n_last_draft[seq_id] = n;
+        const int32_t n = std::max(std::max(1, n_min), std::min(n_cfg, buckets[seq_id].n_cur));
         return n;
     }
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {
-        // start optimistic so a predictable prefix is not throttled from step one
-        acc_ema.assign(n_seq, acc_ema_init);
-        n_last_draft.assign(n_seq, 0);
+        // cold start per sequence; begin() re-resets with the clamped n_max
+        buckets.resize(n_seq);
+        for (auto & b : buckets) {
+            b.reset(n_max, bucket_floor);
+        }
     }
 
     virtual ~common_speculative_impl() = default;
@@ -1303,12 +1279,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (n_draft_batch == 0) {
                 return;
-            }
-
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (dparams[seq_id].drafting) {
-                    set_last_draft(seq_id, n_draft_batch);
-                }
             }
         }
 

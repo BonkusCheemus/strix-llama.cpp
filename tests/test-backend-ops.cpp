@@ -51,7 +51,31 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
-static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+// GGML_TEST_BACKEND_OPS_SEED makes a run reproducible: the same env value and
+// the same tensor give the same data, so a backend diff is a real diff and not
+// a re-roll of the inputs. Returns 0 when unset, which keeps the old
+// non-deterministic path.
+static uint32_t test_tensor_seed(const ggml_tensor * tensor) {
+    const char * seed_env = std::getenv("GGML_TEST_BACKEND_OPS_SEED");
+    if (seed_env == nullptr || *seed_env == '\0') {
+        return 0;
+    }
+
+    uint32_t seed = 2166136261u ^ static_cast<uint32_t>(std::strtoul(seed_env, nullptr, 10));
+    for (const char * p = ggml_get_name(tensor); *p; ++p) {
+        seed ^= static_cast<uint8_t>(*p);
+        seed *= 16777619u;
+    }
+    seed ^= static_cast<uint32_t>(tensor->type);
+    seed *= 16777619u;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        seed ^= static_cast<uint32_t>(tensor->ne[i]);
+        seed *= 16777619u;
+    }
+    return seed == 0 ? 1 : seed;
+}
+
+static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f, uint32_t seed = 0) {
     if (ggml_is_empty(tensor)) {
         return;
     }
@@ -63,7 +87,15 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
 
         auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
+            // not thread_local: a thread_local engine cannot be seeded per call,
+            // and the seed has to differ per thread or every thread fills the
+            // same slice with the same numbers.
+            std::default_random_engine gen;
+            if (seed != 0) {
+                gen.seed(seed ^ static_cast<uint32_t>(start));
+            } else {
+                gen.seed(std::random_device{}());
+            }
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
@@ -148,7 +180,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 }
 
 // generate an F16 mask where certain blocks are randomly masked with -INF value
-static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f, uint32_t seed = 0) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
 
     GGML_TENSOR_LOCALS( int32_t, ne, tensor, ne);
@@ -157,7 +189,8 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
 
     std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(seed != 0 ? seed : rd());
+    auto random_u32 = [&]() -> uint32_t { return seed != 0 ? gen() : rd(); };
     std::uniform_real_distribution<float> dis(min, max);
 
     for (size_t i = 0; i < data_f32.size(); i++) {
@@ -172,12 +205,12 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     const int n_inf_zero_blocks = 0.2*(ne0*ne1*ne2*ne3)/(blck0*blck1);
 
     for (int b = 0; b < n_inf_zero_blocks; b++) {
-        const int p3 = (rd() % ne3);
-        const int p2 = (rd() % ne2);
-        const int p1 = (rd() % ne1);
-        const int p0 = (rd() % ne0);
+        const int p3 = (random_u32() % ne3);
+        const int p2 = (random_u32() % ne2);
+        const int p1 = (random_u32() % ne1);
+        const int p0 = (random_u32() % ne0);
 
-        bool inf = rd() & 1;
+        bool inf = random_u32() & 1;
 
         for (int i1 = 0; i1 < blck1 && p1 + i1 < ne1; i1++) {
             const int idx = p3*ne2*ne1*ne0 + p2*ne1*ne0 + (p1 + i1)*ne0 + p0;
@@ -9461,17 +9494,18 @@ struct test_flash_attn_ext : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const uint32_t seed = test_tensor_seed(t);
             if (strcmp(t->name, "s") == 0) {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
-                init_tensor_uniform(t, -10.0f, 10.0f);
+                init_tensor_uniform(t, -10.0f, 10.0f, seed);
             } else if (strcmp(t->name, "m") == 0) {
                 if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
                 } else {
-                    init_tensor_kq_mask(t);
+                    init_tensor_kq_mask(t, -1.0f, 1.0f, seed);
                 }
             } else {
-                init_tensor_uniform(t);
+                init_tensor_uniform(t, -1.0f, 1.0f, seed);
             }
         }
     }
@@ -13342,6 +13376,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {512, 512, 1, 1}, 0, 1, 0, 1, 0, 0, 0, 0, tfrm, circular));
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {11, 22, 33, 44}, 1, 2, 3, 4, 5, 6, 7, 8, tfrm, circular));
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {11, 22, 33, 44}, 0, 2, 0, 4, 0, 6, 0, 8, tfrm, circular));
+        }
+    }
+
+    // LLM-730 correctness cases: match the LLM-727 live KV/query-row matrix.
+    for (int64_t kv : { 1000, 12000, 45000 }) {
+        for (int64_t n_q : { 1, 2, 4, 8 }) {
+            // TURBO3_0/TURBO4_0 FA cases live on the turbo-KV branch: the types
+            // come from the ggml.h additions in that work and are not in this one.
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, n_q,
+                true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
+                {0, 1, 2, 3}, true, false, 0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, n_q,
+                true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                {0, 1, 2, 3}, true, false, 0));
         }
     }
 

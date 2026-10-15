@@ -107,6 +107,11 @@ public:
     const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
 
+    // qwen4exp QSA inputs, see llama_memory_hybrid_idx_context::set_input_qsa
+    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       bool blk_bias) const;
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore

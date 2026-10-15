@@ -135,28 +135,36 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
-    // flat [ple_head_dim, n_rows] gather target; n_rows is padded, so read it back
+    // flat [ple_head_dim, n_rows] gather target
     if (hparams.ple_n_heads > 0) {
-        const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        const auto & ple_w = ml.require_weight(ple_name.c_str());
-        const int64_t ple_rows = ple_w.tensor->ne[1];
-
-        // sanity check
+        // the head ranges are what the gather indexes, so they set the minimum row count
+        int64_t ple_rows = 0;
         for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
-            if ((int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h] > ple_rows) {
-                throw std::runtime_error(format("PLE head %u range exceeds the %" PRId64 " table rows", h, ple_rows));
-            }
+            ple_rows = std::max(ple_rows, (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
         }
-        if (params.ple_on_disk) {
-            // Counted as created but never allocated, mapped or read: each ubatch preads
-            // exactly the rows it gathers (llm_graph_input_ple::set_input).
+
+        // the converter pads the table; a model synthesised from metadata has no tensor to ask
+        const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+        const auto * ple_w = ml.get_weight(ple_name.c_str());
+        if (ple_w) {
+            if (ple_w->tensor->ne[1] < ple_rows) {
+                throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
+                                                ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
+            }
+            ple_rows = ple_w->tensor->ne[1];
+        }
+
+        // on disk the tensor is counted as created but never allocated, mapped or read: each
+        // ubatch preads exactly the rows it gathers (llm_graph_input_ple::set_input). A model
+        // with no tensor to read from stays on the lazy path.
+        if (params.ple_on_disk && ple_w) {
             llama_ple_disk::params dp;
             dp.n_threads   = params.ple_io_threads;
             dp.cache_bytes = params.ple_cache_mb > 0 ? (size_t) params.ple_cache_mb << 20 : 0;
             dp.direct_io   = params.ple_direct_io;
 
-            ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w.idx), ple_w.offs,
-                                                        ple_w.tensor->type, ple_w.tensor->ne[0], ple_rows, dp);
+            ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w->idx), ple_w->offs,
+                                                        ple_w->tensor->type, ple_w->tensor->ne[0], ple_rows, dp);
             LLAMA_LOG_INFO("%s: PLE n-gram table stays on disk: %s\n", __func__, ple_disk->describe().c_str());
 
             per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
